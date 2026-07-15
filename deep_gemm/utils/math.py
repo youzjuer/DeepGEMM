@@ -111,6 +111,31 @@ def per_token_cast_to_fp4(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
     return packed[:, :n // 2].contiguous(), sf
 
 
+def per_token_cast_to_nvfp4(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize rows to NVFP4 with group-16 UE4M3 scale factors.
+
+    Scale factors are returned four-per-int32 in K order, matching the
+    tcgen05 4X scale-factor input used by the MegaMoE kernel. This helper uses
+    an implicit global scale of one; callers that use a model-level NVFP4
+    global scale must fold its inverse into the GEMM epilogue separately.
+    """
+    # The kernel ABI packs four group-16 scale bytes into each int32 word, so
+    # every row must contain a whole number of packed words.
+    assert x.dim() == 2 and x.size(1) % 64 == 0
+    m, n = x.shape
+    x_view = x.view(m, n // 16, 16)
+    # UE4M3 and positive E4M3FN have identical encodings. Avoid a zero scale
+    # for all-zero groups by clamping to the smallest E4M3 subnormal.
+    sf = (x_view.abs().float().amax(dim=2) / 6.0).clamp_min(2.0 ** -9)
+    sf_e4m3 = sf.to(torch.float8_e4m3fn)
+    x_scaled = x_view * sf_e4m3.float().reciprocal().unsqueeze(2)
+    codes = _quantize_to_fp4_e2m1(x_scaled).view(m, n)
+    codes2 = codes.view(m, n // 2, 2)
+    packed = (codes2[:, :, 0] & 0x0F) | ((codes2[:, :, 1] & 0x0F) << 4)
+    packed_sf = sf_e4m3.contiguous().view(torch.int32)
+    return packed.contiguous(), packed_sf.contiguous()
+
+
 def transpose_packed_fp4(a: torch.Tensor) -> torch.Tensor:
     assert a.dtype == torch.int8
     assert a.dim() == 2
@@ -138,6 +163,11 @@ def unpack_ue8m0_from_int(packed_sf: torch.Tensor) -> torch.Tensor:
     return (packed_sf.view(torch.uint8).to(torch.int) << 23).view(torch.float)
 
 
+def unpack_e4m3_from_int(packed_sf: torch.Tensor) -> torch.Tensor:
+    assert packed_sf.dtype == torch.int32
+    return packed_sf.contiguous().view(torch.float8_e4m3fn).float()
+
+
 def cast_back_from_fp4(packed: torch.Tensor, sf: torch.Tensor, gran_k: int = 128,
                        use_packed_ue8m0: bool = False) -> torch.Tensor:
     m, n2 = packed.shape
@@ -151,3 +181,7 @@ def cast_back_from_fp4(packed: torch.Tensor, sf: torch.Tensor, gran_k: int = 128
     group_idx = torch.arange(n, device=packed.device) // gran_k
     x_restored = x_dequantized * sf[:, group_idx]
     return x_restored
+
+
+def cast_back_from_nvfp4(packed: torch.Tensor, packed_sf: torch.Tensor) -> torch.Tensor:
+    return cast_back_from_fp4(packed, unpack_e4m3_from_int(packed_sf), gran_k=16)

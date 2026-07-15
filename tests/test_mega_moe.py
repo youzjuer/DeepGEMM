@@ -7,7 +7,12 @@ import torch.distributed as dist
 from typing import Tuple
 
 import deep_gemm
-from deep_gemm.utils import per_token_cast_to_fp4, per_token_cast_to_fp8
+from deep_gemm.utils import (
+    cast_back_from_nvfp4,
+    per_token_cast_to_fp4,
+    per_token_cast_to_fp8,
+    per_token_cast_to_nvfp4,
+)
 from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
 from deep_gemm.testing import bench_kineto
 
@@ -33,15 +38,90 @@ def import_baseline():
     return deep_ep, tilelang_ops, do_bench, is_legacy_loaded
 
 
+def run_nvfp4_reference(x, topk_idx, topk_weights, l1_weights, l2_weights,
+                         rank_idx, num_experts_per_rank, group,
+                         activation_clamp):
+    """Slow, independent NVFP4 MegaMoE oracle for correctness tests.
+
+    Each rank evaluates the routes owned by its local experts. The partial
+    outputs are then summed across ranks, mirroring the fused kernel's combine
+    stage. Both GEMMs consume dequantized group-16 NVFP4 operands, and the
+    SwiGLU output is requantized to NVFP4 before L2.
+    """
+    x_dequantized = cast_back_from_nvfp4(*x).to(torch.bfloat16)
+    gathered_x = uneven_all_gather(x_dequantized, group=group)
+    gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
+    gathered_topk_weights = uneven_all_gather(topk_weights, group=group)
+
+    local_num_tokens = torch.tensor([x_dequantized.size(0)], dtype=torch.long, device='cuda')
+    gathered_num_tokens = [torch.zeros_like(local_num_tokens) for _ in range(dist.get_world_size(group))]
+    dist.all_gather(gathered_num_tokens, local_num_tokens, group=group)
+    gathered_num_tokens = [int(v.item()) for v in gathered_num_tokens]
+    local_token_offset = sum(gathered_num_tokens[:rank_idx])
+
+    reference = torch.zeros(
+        (gathered_x.size(0), l2_weights[0].size(1)), dtype=torch.float, device='cuda')
+    first_global_expert = rank_idx * num_experts_per_rank
+    for local_expert_idx in range(num_experts_per_rank):
+        global_expert_idx = first_global_expert + local_expert_idx
+        routes = (gathered_topk_idx == global_expert_idx).nonzero(as_tuple=False)
+        if routes.numel() == 0:
+            continue
+
+        token_indices, topk_slots = routes[:, 0], routes[:, 1]
+        route_weights = gathered_topk_weights[token_indices, topk_slots].float().unsqueeze(1)
+
+        l1_weight = cast_back_from_nvfp4(
+            l1_weights[0][local_expert_idx], l1_weights[1][local_expert_idx]).to(torch.bfloat16)
+        l1_output = torch.matmul(gathered_x[token_indices], l1_weight.t()).to(torch.bfloat16)
+        gate, up = l1_output.chunk(2, dim=1)
+        if activation_clamp is not None:
+            gate = torch.minimum(gate, torch.tensor(activation_clamp, dtype=gate.dtype, device=gate.device))
+            up = torch.clamp(up, min=-activation_clamp, max=activation_clamp)
+
+        gate = gate.float()
+        intermediate = gate / (1.0 + torch.exp(-gate)) * up.float() * route_weights
+        intermediate = cast_back_from_nvfp4(
+            *per_token_cast_to_nvfp4(intermediate)).to(torch.bfloat16)
+
+        l2_weight = cast_back_from_nvfp4(
+            l2_weights[0][local_expert_idx], l2_weights[1][local_expert_idx]).to(torch.bfloat16)
+        route_output = torch.matmul(intermediate, l2_weight.t()).to(torch.bfloat16)
+        reference.index_add_(0, token_indices, route_output.float())
+
+    dist.all_reduce(reference, op=dist.ReduceOp.SUM, group=group)
+    return reference[local_token_offset:local_token_offset + x_dequantized.size(0)].to(torch.bfloat16)
+
+
+def check_nvfp4_reference(actual, reference, max_rel_l2, min_cosine):
+    actual_fp32, reference_fp32 = actual.float(), reference.float()
+    assert torch.isfinite(actual_fp32).all() and torch.isfinite(reference_fp32).all()
+    diff_norm = torch.linalg.vector_norm(actual_fp32 - reference_fp32)
+    reference_norm = torch.linalg.vector_norm(reference_fp32)
+    actual_norm = torch.linalg.vector_norm(actual_fp32)
+    rel_l2 = (diff_norm / reference_norm.clamp_min(1e-12)).item()
+    cosine = (
+        torch.sum(actual_fp32 * reference_fp32)
+        / (actual_norm * reference_norm).clamp_min(1e-12)
+    ).item()
+    assert rel_l2 <= max_rel_l2, f'NVFP4 reference relative L2 {rel_l2:.6f} > {max_rel_l2:.6f}'
+    assert cosine >= min_cosine, f'NVFP4 reference cosine {cosine:.6f} < {min_cosine:.6f}'
+    return rel_l2, cosine
+
+
 # TODO: skip the test for SM90
 # noinspection PyUnboundLocalVariable,PyShadowingNames
 def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    if getattr(args, 'num_sms', 0):
+        deep_gemm.set_num_sms(args.num_sms)
     torch.manual_seed(rank_idx)
     random.seed(rank_idx)
 
     # Settings
     is_bf16xbf16 = args.mma_type == 'bf16xbf16'
+    is_nvfp4 = args.mma_type == 'nvfp4xnvfp4'
+    assert is_bf16xbf16 or is_nvfp4 or args.mma_type == 'fp8xfp4'
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
     num_tokens = max(0, args.num_max_tokens_per_rank - random.randint(0, args.num_max_removed_tokens)) \
         if args.num_tokens == 0 else args.num_tokens
@@ -62,10 +142,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     def _cast_weights_to_fp4(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         num_groups, n, k = bf16_weights.shape
         w = torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.int8)
-        w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
-        for i in range(num_groups):
-            w[i], w_sf[i] = per_token_cast_to_fp4(bf16_weights[i], use_ue8m0=True, gran_k=32)
-        w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
+        if is_nvfp4:
+            w_sf = torch.empty((num_groups, n, k // 64), device='cuda', dtype=torch.int32)
+            for i in range(num_groups):
+                w[i], w_sf[i] = per_token_cast_to_nvfp4(bf16_weights[i])
+        else:
+            w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
+            for i in range(num_groups):
+                w[i], w_sf[i] = per_token_cast_to_fp4(bf16_weights[i], use_ue8m0=True, gran_k=32)
+            w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
         return w, w_sf
 
     # Create inputs
@@ -90,9 +175,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             topk_weights.masked_fill_(topk_idx < 0, 0)
 
         if not is_bf16xbf16:
-            # FP8 path: cast inputs to FP8/FP4 with per-32 UE8M0 SF
             assert hidden % 128 == 0 and intermediate_hidden % 128 == 0
-            x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+            x = per_token_cast_to_nvfp4(x) if is_nvfp4 else \
+                per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
             l1_weights = _cast_weights_to_fp4(l1_weights)
             l2_weights = _cast_weights_to_fp4(l2_weights)
 
@@ -117,7 +202,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math))
-        (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
+        kernel_fn = deep_gemm.bf16_mega_moe if is_bf16xbf16 else \
+            (deep_gemm.nvfp4_mega_moe if is_nvfp4 else deep_gemm.fp8_fp4_mega_moe)
+        kernel_fn(**kernel_kwargs)
         return y, cumulative_local_expert_recv_stats_fused
 
     dist_print('Config:', once_in_node=True)
@@ -144,6 +231,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Non-overlapped baseline: EP dispatch + GEMM + EP combine
     deep_ep, tilelang_ops, tilelang_bench, is_legacy_loaded = import_baseline()
+    # The legacy oracle has no NVFP4 dispatch/GEMM path.
+    if is_nvfp4:
+        is_legacy_loaded = False
     alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
     deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
     ep_buffer = deep_ep.ElasticBuffer(
@@ -213,8 +303,30 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
                 dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed', once_in_node=True)
         dist_print(once_in_node=True)
+    elif is_nvfp4 and num_correctness_tests > 0:
+        max_rel_l2 = getattr(args, 'nvfp4_max_rel_l2', 0.05)
+        min_cosine = getattr(args, 'nvfp4_min_cosine', 0.999)
+        dist_print(
+            f'Running NVFP4 reference tests (rel-L2 <= {max_rel_l2}, cosine >= {min_cosine}):',
+            once_in_node=True)
+        for i in range(num_correctness_tests):
+            create_inputs()
+            y_fused, _ = run_fused()
+            y_reference = run_nvfp4_reference(
+                x, topk_idx, topk_weights, l1_weights, l2_weights,
+                rank_idx, num_experts_per_rank, group, args.activation_clamp)
+            rel_l2, cosine = check_nvfp4_reference(
+                y_fused, y_reference, max_rel_l2=max_rel_l2, min_cosine=min_cosine)
+            dist_print(
+                f' > Correctness test #{i + 1}/{num_correctness_tests} passed: '
+                f'rel-L2={rel_l2:.6f}, cosine={cosine:.6f}',
+                once_in_node=True)
+        dist_print(once_in_node=True)
     else:
         create_inputs()
+        if is_nvfp4:
+            y_smoke, _ = run_fused()
+            assert torch.isfinite(y_smoke).all()
 
     # Count local received tokens
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
@@ -235,7 +347,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # HBM bytes: weights + activations + output
     num_touched_experts = torch.unique(gathered_topk_idx[gathered_topk_idx >= 0]).numel()
-    act_elem_size, weight_elem_size = (2, 2) if is_bf16xbf16 else (1, 0.5)
+    act_elem_size, weight_elem_size = (2, 2) if is_bf16xbf16 else ((0.5, 0.5) if is_nvfp4 else (1, 0.5))
     num_hbm_bytes = (
         num_touched_experts * intermediate_hidden * 2 * hidden * weight_elem_size   # L1 weights
         + num_touched_experts * hidden * intermediate_hidden * weight_elem_size     # L2 weights
@@ -247,7 +359,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     hbm_gbs = safe_div(num_hbm_bytes / 1e9, t_fused)
 
     # NVLink bytes: dispatch pull + combine write-back
-    num_nvlink_bytes = num_recv_tokens * hidden * 3
+    num_nvlink_bytes = num_recv_tokens * hidden * (2.5 if is_nvfp4 else 3)
     nvlink_gbs = safe_div(num_nvlink_bytes / 1e9, t_fused)
 
     # Combine reduction (serial) time approximation
@@ -279,6 +391,7 @@ if __name__ == '__main__':
     # Resource settings
     parser.add_argument('--ncu-profile-only', action='store_true', help='Only run profiling without correctness test')
     parser.add_argument('--num-processes', type=int, default=8, help='Number of processes to spawn (default: 8)')
+    parser.add_argument('--num-sms', type=int, default=0, help='Override active SM count for debugging')
 
     # Model settings
     parser.add_argument('--num-max-tokens-per-rank', type=int, default=8192, help='Number of maximum tokens per rank')
@@ -291,10 +404,15 @@ if __name__ == '__main__':
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
-    parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
+    parser.add_argument('--mma-type', type=str, default='fp8xfp4',
+                        help='MMA type: fp8xfp4, nvfp4xnvfp4, or bf16xbf16')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
+    parser.add_argument('--nvfp4-max-rel-l2', type=float, default=0.05,
+                        help='Maximum relative L2 error accepted by the NVFP4 reference oracle')
+    parser.add_argument('--nvfp4-min-cosine', type=float, default=0.999,
+                        help='Minimum cosine similarity accepted by the NVFP4 reference oracle')
     parser.add_argument('--dump-profile-traces', type=str, default='', help='Dump profiling trace JSONs')
     parser.add_argument('--local-rank-idx', type=int, default=None, help='Run as single process with this local rank (e.g. for NCU prof)')
     args = parser.parse_args()

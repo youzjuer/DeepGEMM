@@ -91,6 +91,33 @@ uint32_t advance_umma_desc_lo(const uint32_t& base, const uint32_t& offset, cons
     return base + (((offset + k_idx * get_umma_desc_stride_k<kMajorMode, BLOCK_MN, kSwizzleMode, dtype_t>()) * static_cast<uint32_t>(sizeof(dtype_t))) >> 4u);
 }
 
+template <cute::UMMA::Major kMajorMode, uint32_t BLOCK_MN, uint32_t BLOCK_K, uint32_t kSwizzleMode>
+CUTLASS_DEVICE
+cute::UMMA::SmemDescriptor make_umma_desc_packed_fp4(
+        uint8_t* base_smem_ptr, uint32_t mn_idx, uint32_t k_idx) {
+    DG_STATIC_ASSERT(kMajorMode == cute::UMMA::Major::K,
+                     "Packed FP4 MegaMoE currently supports K-major operands only");
+    DG_STATIC_ASSERT(BLOCK_K == kSwizzleMode * 2 and kSwizzleMode == 128,
+                     "Packed FP4 SW128 descriptors require 256 logical K values");
+    DG_STATIC_ASSERT(BLOCK_K % 2 == 0, "Invalid packed FP4 block size");
+    DG_DEVICE_ASSERT(k_idx % 2 == 0);
+    constexpr auto layout_type = cute::UMMA::LayoutType::SWIZZLE_128B;
+    constexpr uint32_t num_non_contiguous = 8;
+    constexpr uint32_t packed_row_bytes = BLOCK_K / 2;
+    return make_smem_desc(
+        layout_type,
+        base_smem_ptr + mn_idx * packed_row_bytes + k_idx / 2,
+        num_non_contiguous * packed_row_bytes,
+        0);
+}
+
+CUTLASS_DEVICE
+uint32_t advance_umma_desc_lo_packed_fp4(
+        const uint32_t& base, const uint32_t& byte_offset, const uint32_t& k_idx) {
+    DG_DEVICE_ASSERT(k_idx % 2 == 0);
+    return base + ((byte_offset + k_idx / 2) >> 4u);
+}
+
 template <cute::UMMA::Major kMajorMode, uint32_t BLOCK_MN, uint32_t BLOCK_K, uint32_t kSwizzleMode, bool kUseBase32 = false, typename dtype_t>
 CUTLASS_DEVICE
 cute::UMMA::SmemDescriptor make_umma_desc(dtype_t* base_smem_ptr, uint32_t mn_idx, uint32_t k_idx) {

@@ -25,6 +25,7 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
+        bool use_nvfp4;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -70,6 +71,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
+        {},
         {}
     >);
 }};
@@ -87,7 +89,8 @@ static void __instantiate_kernel() {{
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
-    args.fast_math ? "true" : "false");
+    args.fast_math ? "true" : "false",
+    args.use_nvfp4 ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -123,7 +126,8 @@ static void sm100_fp8_fp4_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& use_nvfp4 = false
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -135,16 +139,16 @@ static void sm100_fp8_fp4_mega_moe(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
-        MmaKind::MXFP8FP4);
+        use_nvfp4 ? MmaKind::NVFP4 : MmaKind::MXFP8FP4);
 
     // Make tensormap
-    constexpr int kGranK = 32;
+    const int kGranK = use_nvfp4 ? 16 : 32;
     const int sf_smem_outer_dim = config.block_k / (kGranK * 4);
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
                                                      hidden, config.num_ring_tokens,
                                                      config.block_k, config.load_block_m,
                                                      static_cast<int>(l1_acts.stride(-2)),
-                                                     config.swizzle_acts_mode);
+                                                     config.swizzle_acts_mode, 0, false, not use_nvfp4);
     const auto tensor_map_l1_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
                                                         config.num_sf_ring_tokens, hidden,
                                                         config.sf_block_m, kGranK,
@@ -154,7 +158,7 @@ static void sm100_fp8_fp4_mega_moe(
                                                         hidden, num_experts_per_rank * intermediate_hidden * 2,
                                                         config.block_k, config.load_block_n,
                                                         static_cast<int>(l1_weights.stride(-2)),
-                                                        config.swizzle_weights_mode);
+                                                        config.swizzle_weights_mode, 0, false, not use_nvfp4);
     const auto tensor_map_l1_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
                                                            intermediate_hidden * 2, hidden,
                                                            config.block_n, kGranK,
@@ -163,16 +167,26 @@ static void sm100_fp8_fp4_mega_moe(
     // NOTES: L1 output and L2 activations are essentially the same tensor.
     // Post-SwiGLU output has half the N width (`BLOCK_N / 2` per input tile),
     // so the swizzle mode is also halved (128 -> 64).
-    const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
-                                                       intermediate_hidden, config.num_ring_tokens,
-                                                       config.block_n / 2, config.store_block_m,
-                                                       static_cast<int>(l2_acts.stride(-2)),
-                                                       config.swizzle_acts_mode / 2);
+    // FP4 TMA with unpacked shared-memory payload requires a 128-element
+    // inner box, while post-SwiGLU produces only BLOCK_N/2 = 64 elements.
+    // The NVFP4 epilogue therefore packs and stores directly; keep a valid
+    // load-style descriptor as an unused launch-ABI placeholder.
+    const auto tensor_map_l1_output = use_nvfp4 ?
+        make_tma_2d_desc(l2_acts,
+                         intermediate_hidden, config.num_ring_tokens,
+                         config.block_k, config.load_block_m,
+                         static_cast<int>(l2_acts.stride(-2)),
+                         config.swizzle_acts_mode, 0, false, false) :
+        make_tma_2d_desc(l2_acts,
+                         intermediate_hidden, config.num_ring_tokens,
+                         config.block_n / 2, config.store_block_m,
+                         static_cast<int>(l2_acts.stride(-2)),
+                         config.swizzle_acts_mode / 2);
     const auto tensor_map_l2_acts = make_tma_2d_desc(l2_acts,
                                                      intermediate_hidden, config.num_ring_tokens,
                                                      config.block_k, config.load_block_m,
                                                      static_cast<int>(l2_acts.stride(-2)),
-                                                     config.swizzle_acts_mode);
+                                                     config.swizzle_acts_mode, 0, false, not use_nvfp4);
     const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
                                                         config.num_sf_ring_tokens, intermediate_hidden,
                                                         config.sf_block_m, kGranK,
@@ -182,7 +196,7 @@ static void sm100_fp8_fp4_mega_moe(
                                                         intermediate_hidden, num_experts_per_rank * hidden,
                                                         config.block_k, config.load_block_n,
                                                         static_cast<int>(l2_weights.stride(-2)),
-                                                        config.swizzle_weights_mode);
+                                                        config.swizzle_weights_mode, 0, false, not use_nvfp4);
     const auto tensor_map_l2_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
                                                            hidden, intermediate_hidden,
                                                            config.block_n, kGranK,
@@ -203,6 +217,7 @@ static void sm100_fp8_fp4_mega_moe(
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
+        .use_nvfp4 = use_nvfp4,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -223,7 +238,8 @@ static void sm100_fp8_fp4_mega_moe(
     };
 
     const auto code = SM100FP8FP4MegaMoERuntime::generate(args);
-    const auto runtime = compiler->build("sm100_fp8_fp4_mega_moe", code);
+    const auto runtime = compiler->build(
+        use_nvfp4 ? "sm100_nvfp4_mega_moe" : "sm100_fp8_fp4_mega_moe", code);
     SM100FP8FP4MegaMoERuntime::launch(runtime, args);
 }
 

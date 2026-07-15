@@ -8,6 +8,44 @@
 
 namespace deep_gemm::tma {
 
+// Packed FP4 TMA keeps 16 FP4 values in 8 contiguous shared-memory bytes.
+// A SW128 atom therefore spans 256 logical FP4 values and is issued with one
+// TMA operation (unlike the ALIGN16B unpack-SMEM format used by MXFP8xFP4).
+template <uint32_t BLOCK_INNER, uint32_t BLOCK_OUTER,
+          uint32_t kSwizzleMode, bool kIs3DTMA = false>
+CUTLASS_DEVICE void
+copy_packed_fp4(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr,
+                uint8_t* smem_ptr, const uint32_t& inner_idx, const uint32_t& outer_idx,
+                const uint32_t& num_tma_multicast = 1, const uint32_t& batch_idx = 0) {
+    DG_STATIC_ASSERT(BLOCK_INNER == 256 and kSwizzleMode == 128,
+                     "Packed FP4 SW128 TMA requires a 256-element inner atom");
+    if constexpr (not kIs3DTMA) {
+        if (num_tma_multicast == 1) {
+            cute::SM90_TMA_LOAD_2D::copy(
+                desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
+                static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                smem_ptr, inner_idx, outer_idx);
+        } else {
+            cute::SM100_TMA_2SM_LOAD_2D::copy(
+                desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
+                static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                smem_ptr, inner_idx, outer_idx);
+        }
+    } else {
+        if (num_tma_multicast == 1) {
+            cute::SM90_TMA_LOAD_3D::copy(
+                desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
+                static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                smem_ptr, inner_idx, outer_idx, batch_idx);
+        } else {
+            cute::SM100_TMA_2SM_LOAD_3D::copy(
+                desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
+                static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                smem_ptr, inner_idx, outer_idx, batch_idx);
+        }
+    }
+}
+
 template <uint32_t BLOCK_INNER, uint32_t kSwizzleMode, typename dtype_t>
 constexpr uint32_t get_inner_block_atom_size() {
     return kSwizzleMode == 0 ? BLOCK_INNER : kSwizzleMode / sizeof(dtype_t);

@@ -130,6 +130,19 @@ def _transpose_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(sf).copy_(result)
 
 
+def _ensure_mn_major_packed_sf(sf: torch.Tensor) -> torch.Tensor:
+    """Place packed 4-byte SF words in the MN-major TMA layout."""
+    if sf.stride(-2) == 1:
+        return sf
+    *prefix, mn, packed_sf_k = sf.shape
+    padded_mn = align(mn, 4)  # four int32 values are 16-byte TMA aligned
+    backing = torch.empty((*prefix, packed_sf_k, padded_mn),
+                          dtype=sf.dtype, device=sf.device)
+    result = backing.transpose(-1, -2)[..., :mn, :]
+    result.copy_(sf)
+    return result
+
+
 def transform_weights_for_mega_moe(
     l1_weights: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     l2_weights: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -138,12 +151,16 @@ def transform_weights_for_mega_moe(
              Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
     assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
     if isinstance(l1_weights, tuple):
-        # FP8: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
+        # Low-precision path: interleave gate/up for weight and packed SF,
+        # then transpose L1 SF for UTCCP. This applies to both MXFP8/MXFP4
+        # and NVFP4/NVFP4.
         l1_w = _interleave_weights(l1_weights[0])
-        l1_sf = _transpose_sf_for_utccp(_interleave_weights(l1_weights[1]))
+        l1_sf_input = _ensure_mn_major_packed_sf(l1_weights[1])
+        l2_sf_input = _ensure_mn_major_packed_sf(l2_weights[1])
+        l1_sf = _transpose_sf_for_utccp(_interleave_weights(l1_sf_input))
         l1_transformed = (l1_w, l1_sf)
         # L2: only transpose SF for UTCCP
-        l2_transformed = (l2_weights[0], _transpose_sf_for_utccp(l2_weights[1]))
+        l2_transformed = (l2_weights[0], _transpose_sf_for_utccp(l2_sf_input))
     else:
         # BF16: L1 interleave gate/up, L2 unchanged
         l1_transformed = _interleave_weights(l1_weights)
@@ -162,6 +179,30 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True):
     _C.fp8_fp4_mega_moe(
+        y,
+        l1_weights, l2_weights,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe,
+        activation, activation_clamp,
+        fast_math,
+        sym_buffer.num_ring_tokens
+    )
+
+
+def nvfp4_mega_moe(y: torch.Tensor,
+                    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                    sym_buffer: SymmBuffer,
+                    cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                    recipe: Tuple[int, int, int] = (1, 1, 16),
+                    activation: str = 'swiglu',
+                    activation_clamp: Optional[float] = None,
+                    fast_math: bool = True):
+    _C.nvfp4_mega_moe(
         y,
         l1_weights, l2_weights,
         cumulative_local_expert_recv_stats,

@@ -103,7 +103,7 @@ static int get_num_wave_pool_tokens(
 static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
-    const int& num_tokens,
+    const int& num_tokens, const int& hidden, const int& intermediate_hidden,
     const MmaKind& mma_kind) {
     auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_warpgroups] = [&]() -> std::tuple<int, int, int, int, int> {
         float num_expected_tokens_per_expert = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
@@ -128,6 +128,15 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
         }
     }();
     block_k = mma_kind == MmaKind::NVFP4 ? 256 : block_k / get_num_mma_elem_bytes(mma_kind);
+    const bool use_g1_m160_block_m32 =
+        get_env<int>("DG_NVFP4_MEGAMOE_G1_M160_BLOCK_M32", 0) != 0 and
+        num_ranks == 8 and num_experts == 512 and num_topk == 10 and
+        num_tokens == 160 and hidden == 4096 and intermediate_hidden == 1024;
+    if (mma_kind == MmaKind::NVFP4 and block_m == 64 and use_g1_m160_block_m32) {
+        block_m = 32;
+        store_block_m = 16;
+        num_epilogue_warpgroups = 2;
+    }
 
     // Check whether our `block_m` lies in `kCandidateBlockM`
     DG_HOST_ASSERT(std::any_of(
@@ -261,7 +270,9 @@ static MegaMoEConfig get_mega_moe_config(
 
     // Block config
     const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
+        get_block_config_for_mega_moe(
+            num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+            num_tokens, hidden, intermediate_hidden, mma_kind);
     const int block_n = 128;
     const int load_block_m = block_m / 2;
     const int load_block_n = block_n;

@@ -39,10 +39,12 @@ struct TokenSrcMetadata {
 
 struct Workspace {
     void* base;
+    void* banked_metadata_base;
     uint32_t num_ranks, num_experts;
     uint32_t num_experts_per_rank;
     uint32_t num_max_tokens_per_rank;
     uint32_t num_max_recv_tokens_per_expert;
+    uint32_t metadata_bank_idx;
 
     // Ring-buffer capacity used by reusable token/data buffers
     uint32_t num_ring_tokens;
@@ -54,35 +56,43 @@ struct Workspace {
     // For both grid barrier and NVLink barrier
     static constexpr uint64_t kNumBarrierSignalBytes = 32;
 
+    // Only the remotely accumulated recv sums are double-buffered. Per-rank
+    // recv counts are fully overwritten every launch (including zero-count
+    // experts), while send/ring counters are local-only. Source/route metadata
+    // is likewise overwritten before every live entry is consumed.
+    static constexpr uint32_t kNumMetadataBanks = 2;
+
     CUTLASS_HOST_DEVICE
     Workspace(void* base,
               const uint32_t& num_ranks,
               const uint32_t& num_experts,
               const uint32_t& num_max_tokens_per_rank,
               const uint32_t& num_topk,
-              const uint32_t& num_ring_tokens):
+              const uint32_t& num_ring_tokens,
+              const uint32_t& metadata_bank_idx = 0):
         base(base),
         num_ranks(num_ranks), num_experts(num_experts),
         num_max_tokens_per_rank(num_max_tokens_per_rank),
+        metadata_bank_idx(metadata_bank_idx),
         num_ring_tokens(num_ring_tokens) {
         num_experts_per_rank = num_experts / num_ranks;
         num_max_recv_tokens_per_expert = num_ranks * num_max_tokens_per_rank;
         num_max_pool_tokens = get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
         num_ring_blocks = num_ring_tokens / kMinCandidateBlockM;
+        banked_metadata_base = math::advance_ptr(
+            base, kNumBarrierSignalBytes + get_shared_metadata_num_bytes() +
+                  metadata_bank_idx * get_metadata_bank_num_bytes());
     }
 
     CUTLASS_HOST_DEVICE
-    uint64_t get_num_bytes() const {
+    uint64_t get_shared_metadata_num_bytes() const {
         uint64_t num_bytes = 0;
 
-        // Barrier
-        num_bytes += kNumBarrierSignalBytes;
+        // Expert send count (local writes only)
+        num_bytes += num_experts * sizeof(uint64_t);
 
-        // Expert send/recv count
-        num_bytes += num_experts * sizeof(uint64_t) * 2;
-
-        // Expert recv count sum
-        num_bytes += num_experts_per_rank * sizeof(uint64_t);
+        // Per-rank expert recv counts (fully overwritten every launch)
+        num_bytes += num_experts * sizeof(uint64_t);
 
         // L1 full token count (ring)
         num_bytes += num_ring_blocks * sizeof(uint32_t);
@@ -95,6 +105,30 @@ struct Workspace {
 
         // L2 empty block count (ring)
         num_bytes += num_ring_blocks * sizeof(uint32_t);
+
+        return math::align<uint64_t>(num_bytes, 16);
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint64_t get_metadata_bank_num_bytes() const {
+        uint64_t num_bytes = 0;
+
+        // Expert recv sums receive cross-rank atomic additions.
+        num_bytes += num_experts_per_rank * sizeof(uint64_t);
+
+        return math::align<uint64_t>(num_bytes, 16);
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint64_t get_num_bytes() const {
+        uint64_t num_bytes = 0;
+
+        // Barrier state is shared by all metadata generations.
+        num_bytes += kNumBarrierSignalBytes;
+
+        // Local-only counters plus double-buffered remote-write counters.
+        num_bytes += get_shared_metadata_num_bytes();
+        num_bytes += kNumMetadataBanks * get_metadata_bank_num_bytes();
 
         // Dispatch pulling source token-topk
         num_bytes += num_experts_per_rank * num_ranks * num_max_recv_tokens_per_expert * sizeof(int);
@@ -110,6 +144,16 @@ struct Workspace {
     CUTLASS_HOST_DEVICE
     void* get_end_ptr() const {
         return math::advance_ptr(base, get_num_bytes());
+    }
+
+    CUTLASS_HOST_DEVICE
+    Workspace with_metadata_bank(const uint32_t& bank_idx) const {
+        auto result = *this;
+        result.metadata_bank_idx = bank_idx;
+        result.banked_metadata_base = math::advance_ptr(
+            base, kNumBarrierSignalBytes + get_shared_metadata_num_bytes() +
+                  bank_idx * get_metadata_bank_num_bytes());
+        return result;
     }
 
     // Grid sync counters: `kNumBarrierSignalBytes` layout
@@ -144,18 +188,19 @@ struct Workspace {
     CUTLASS_DEVICE
     uint64_t* get_expert_recv_count_ptr(
         const uint32_t& rank_idx = 0, const uint32_t& expert_idx = 0) const {
-        return get_expert_send_count_ptr(num_experts) + rank_idx * num_experts_per_rank + expert_idx;
+        return get_expert_send_count_ptr(num_experts) +
+            rank_idx * num_experts_per_rank + expert_idx;
     }
 
     CUTLASS_DEVICE
     uint64_t* get_expert_recv_count_sum_ptr(const uint32_t& expert_idx = 0) const {
-        return get_expert_send_count_ptr(num_experts * 2) + expert_idx;
+        return static_cast<uint64_t*>(banked_metadata_base) + expert_idx;
     }
 
     CUTLASS_DEVICE
     uint32_t* get_l1_full_count_ptr(const uint32_t& ring_block_idx = 0) const {
-        const auto base = get_expert_recv_count_sum_ptr(num_experts_per_rank);
-        return reinterpret_cast<uint32_t*>(base) + ring_block_idx;
+        const auto ring_base = get_expert_send_count_ptr(num_experts * 2);
+        return reinterpret_cast<uint32_t*>(ring_base) + ring_block_idx;
     }
 
     CUTLASS_DEVICE
@@ -180,8 +225,10 @@ struct Workspace {
     CUTLASS_DEVICE
     uint32_t* get_src_token_topk_idx_ptr(
         const uint32_t& expert_idx = 0, const uint32_t& rank_idx = 0, const uint32_t& token_idx = 0) const {
-        const auto base = get_l2_empty_count_ptr(num_ring_blocks);
-        return reinterpret_cast<uint32_t*>(base) +
+        const auto metadata_end = math::advance_ptr(
+            base, kNumBarrierSignalBytes + get_shared_metadata_num_bytes() +
+                  kNumMetadataBanks * get_metadata_bank_num_bytes());
+        return reinterpret_cast<uint32_t*>(metadata_end) +
             expert_idx * (num_ranks * num_max_recv_tokens_per_expert) +
             rank_idx * num_max_recv_tokens_per_expert + token_idx;
     }

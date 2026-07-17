@@ -38,6 +38,7 @@ template <
     float kActivationClamp,
     bool kFastMath,
     bool kUseNVFP4 = false,
+    bool kUseEpochWorkspace = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -74,6 +75,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
+    DG_STATIC_ASSERT(not kUseEpochWorkspace or kUseNVFP4,
+                     "Epoch workspace is currently supported only by NVFP4 MegaMoE");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -96,7 +99,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     }
 
     // Workspaces
-    const auto workspace = layout::Workspace(
+    const auto workspace_layout = layout::Workspace(
         sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk, kNumRingTokens);
 
     // Token and buffer layouts
@@ -112,7 +115,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Registered inputs
     const auto input_token_buffer = layout::Buffer(
         lowp_token_layout, 1, kNumMaxTokensPerRank,
-        workspace.get_end_ptr());
+        workspace_layout.get_end_ptr());
     const auto input_sf_buffer = layout::Buffer(
         lowp_sf_layout, 1, kNumMaxTokensPerRank,
         input_token_buffer.get_end_ptr());
@@ -222,6 +225,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         Barrier tmem_empty_barriers[kNumEpilogueStages];
         Barrier combine_barriers[kNumEpilogueWarps * 2];
         uint32_t tmem_ptr_in_smem;
+        uint32_t metadata_bank_idx;
     };
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
@@ -256,6 +260,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 shared_storage.expert_token_count,
                 math::constexpr_align<uint32_t>(kNumExperts * sizeof(uint32_t), kSharedMemoryAlignment)
             );
+            const auto barrier_generation = ptx::ld_acq(
+                workspace_layout.get_nvl_barrier_counter_ptr());
+            shared_storage.metadata_bank_idx = kUseEpochWorkspace ?
+                ((barrier_generation >> 1) & 1u) : 0u;
         }
     } else if (warp_idx == 1) {
         // Init m-barriers for dispatch
@@ -291,6 +299,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // NOTES: Using `.relaxed` is allowed here since `fence_barrier_init` is `.release.cluster`,
     // and `barrier.cluster.wait.aligned` is by default `.acquire`
     comm::cluster_sync_with_relaxed_arrive();
+
+    // Two NVLink barriers are issued per epoch-enabled launch. Their device
+    // generation therefore alternates the active metadata bank without a host
+    // argument, including under CUDA Graph replay. Each active bank is cleaned
+    // while its launch combines, then remains unused for one full launch before
+    // reuse; that intervening dispatch barrier supplies cross-rank confirmation.
+    const auto workspace = workspace_layout.with_metadata_bank(
+        shared_storage.metadata_bank_idx);
 
     // Task scheduler
     auto scheduler = sched::MegaMoEScheduler<
@@ -412,13 +428,25 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Barrier before pulling
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
-                             kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
-            /* After the NVLink barrier, there is a grid sync */ true
-        );
+        if constexpr (kUseEpochWorkspace) {
+            comm::nvlink_epoch_barrier<
+                kNumRanks, kNumSMs, kNumDispatchThreads,
+                kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
+                workspace, sym_buffer, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+                /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
+                /* After the NVLink barrier, there is a grid sync */ true
+            );
+        } else {
+            comm::nvlink_barrier<
+                kNumRanks, kNumSMs, kNumDispatchThreads,
+                kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
+                workspace, sym_buffer, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+                /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
+                /* After the NVLink barrier, there is a grid sync */ true
+            );
+        }
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -612,8 +640,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
         }
 
-        // Clean workspace for the next usage, and also do cumulative stats
-        // NOTES: it is overlapped with combine reduction epilogue
+        // The epilogue reaches this handoff after publishing all remote L2
+        // outputs. Cleanup therefore overlaps combine in both lifecycle modes.
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         DG_STATIC_ASSERT(kNumSMs > 1, "Invalid SM count");
@@ -646,9 +674,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     __syncwarp();
                 }
 
-                // Clean per-rank token count
-                for (uint32_t j = thread_idx; j < kNumRanks; j += kNumDispatchThreads)
-                    *workspace.get_expert_recv_count_ptr(j, i) = 0;
+                // Legacy mode clears per-rank counts in place. Epoch mode
+                // leaves them intact because every source rank overwrites all
+                // expert entries before the next dispatch barrier.
+                if constexpr (not kUseEpochWorkspace) {
+                    for (uint32_t j = thread_idx; j < kNumRanks; j += kNumDispatchThreads)
+                        *workspace.get_expert_recv_count_ptr(j, i) = 0;
+                }
                 __syncwarp();
 
                 // Clean L1 and L2 full stuffs and ring buffer counts
@@ -662,14 +694,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
 
-        // Wait for all ranks to finish cleaning
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
-                             kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            /* Before the NVLink barrier, there is a grid sync */ true,
-            /* At the end of kernel does not need to sync */ false
-        );
+        if constexpr (not kUseEpochWorkspace) {
+            // Wait for all ranks to finish cleaning
+            comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                                 kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
+                workspace, sym_buffer, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+                /* Before the NVLink barrier, there is a grid sync */ true,
+                /* At the end of kernel does not need to sync */ false
+            );
+        }
     } else if (warp_idx == kNumDispatchWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -1402,14 +1436,29 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             Allocator().free(0, kNumTmemCols);
 
         // NVLink barrier (grid sync + cross-rank signal + grid sync): ~4 us
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
-                             kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
-            workspace, sym_buffer, sm_idx, epilogue_thread_idx,
-            [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
-        );
+        if constexpr (kUseEpochWorkspace) {
+            comm::nvlink_epoch_barrier<
+                kNumRanks, kNumSMs, kNumEpilogueThreads,
+                kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
+                workspace, sym_buffer, sm_idx, epilogue_thread_idx,
+                [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
+            );
+        } else {
+            comm::nvlink_barrier<
+                kNumRanks, kNumSMs, kNumEpilogueThreads,
+                kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
+                workspace, sym_buffer, sm_idx, epilogue_thread_idx,
+                [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
+            );
+        }
 
-        // Barrier with dispatch warps, so that they can do clean workspace
-        ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        // Start active-bank cleanup after output publication and overlap it
+        // with combine. Epoch mode reuses this bank only two launches later;
+        // the intervening launch's dispatch barrier confirms every rank has
+        // completed the cleanup before that reuse.
+        ptx::sync_unaligned(
+            kNumDispatchThreads + kNumEpilogueThreads,
+            kDispatchWithEpilogueBarrierIdx);
 
         // Combine: reduce top-k results and write back
         // NOTES: reuse shared memory from start up to the barriers

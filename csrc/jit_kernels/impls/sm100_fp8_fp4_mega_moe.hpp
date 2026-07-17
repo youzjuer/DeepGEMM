@@ -26,6 +26,7 @@ public:
         float activation_clamp;
         bool fast_math;
         bool use_nvfp4;
+        bool use_epoch_workspace;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -72,6 +73,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -90,7 +92,8 @@ static void __instantiate_kernel() {{
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
-    args.use_nvfp4 ? "true" : "false");
+    args.use_nvfp4 ? "true" : "false",
+    args.use_epoch_workspace ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -210,6 +213,8 @@ static void sm100_fp8_fp4_mega_moe(
 
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
+    const bool use_epoch_workspace = use_nvfp4 and
+        get_env<int>("DG_NVFP4_MEGAMOE_EPOCH_WORKSPACE", 0) != 0;
     const SM100FP8FP4MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
@@ -218,6 +223,7 @@ static void sm100_fp8_fp4_mega_moe(
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
         .use_nvfp4 = use_nvfp4,
+        .use_epoch_workspace = use_epoch_workspace,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

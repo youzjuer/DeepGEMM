@@ -88,4 +88,59 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
         grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
 }
 
+// Two-barrier epoch protocol. Each tag owns one uint32 signal and monotonically
+// advances it by `kNumRanks` per launch. Targets are calculated modulo 2^32,
+// avoiding the alternating +/- signal state used by the generic three-barrier
+// protocol. This also gives CUDA Graph replay a stable barrier path on every
+// generation while preserving wrap-around without physical signal clearing.
+template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads,
+          uint32_t kGridSyncIndex, uint32_t kTag, typename sync_scope_t>
+CUTLASS_DEVICE void nvlink_epoch_barrier(
+        const layout::Workspace& workspace,
+        const layout::SymBuffer<kNumRanks>& sym_buffer,
+        const uint32_t& sm_idx, const uint32_t& thread_idx,
+        const sync_scope_t& sync_scope,
+        const bool& sync_prologue = true,
+        const bool& sync_epilogue = true) {
+    DG_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
+    DG_STATIC_ASSERT(kTag == 1 or kTag == 2, "Epoch barrier tag out of bounds");
+
+    if (sync_prologue)
+        grid_sync<kNumSMs, kGridSyncIndex>(
+            workspace, sm_idx, thread_idx, sync_scope);
+
+    if (sm_idx == 0) {
+        auto* counter_ptr = workspace.get_nvl_barrier_counter_ptr();
+        const uint32_t generation = *counter_ptr;
+        auto* signal_ptr = reinterpret_cast<uint32_t*>(
+            workspace.get_nvl_barrier_signal_ptr(kTag - 1));
+
+        if (thread_idx < kNumRanks)
+            ptx::red_add_rel_sys(
+                reinterpret_cast<uint32_t*>(
+                    sym_buffer.map(signal_ptr, thread_idx)),
+                1u);
+        sync_scope();
+
+        if (thread_idx == 0) {
+            ptx::red_add(counter_ptr, 1u);
+            const uint32_t target =
+                (generation / 2u + 1u) * kNumRanks;
+            const auto start_clock = clock64();
+            while (ptx::ld_acq_sys(signal_ptr) != target) {
+                if (clock64() - start_clock >= kNumTimeoutCycles) {
+                    printf("DeepGEMM epoch NVLink barrier timeout: rank=%d, counter=%u, signal=%u, target=%u, tag=%u\n",
+                           sym_buffer.rank_idx, *counter_ptr,
+                           ptx::ld_acq_sys(signal_ptr), target, kTag);
+                    DG_DEVICE_ASSERT(false and "Epoch NVLink barrier timeout");
+                }
+            }
+        }
+    }
+
+    if (sync_epilogue)
+        grid_sync<kNumSMs, kGridSyncIndex>(
+            workspace, sm_idx, thread_idx, sync_scope);
+}
+
 } // namespace deep_gemm::comm

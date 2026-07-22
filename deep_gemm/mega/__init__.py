@@ -201,7 +201,19 @@ def nvfp4_mega_moe(y: torch.Tensor,
                     recipe: Tuple[int, int, int] = (1, 1, 16),
                     activation: str = 'swiglu',
                     activation_clamp: Optional[float] = None,
-                    fast_math: bool = True):
+                    fast_math: bool = True,
+                    expert_routing_map: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
+    """Run fused NVFP4 MegaMoE.
+
+    ``expert_routing_map`` optionally contains ``(choices, counts)``.  Choices
+    is a contiguous int32 ``[num_logical_experts, max_instances]`` tensor of
+    physical expert IDs and counts is a contiguous int32 tensor with one valid
+    instance count per logical expert.  When present, ``sym_buffer.topk_idx``
+    contains logical IDs and dispatch deterministically selects one persistent
+    physical instance for each route.  Dispatch rewrites those registered
+    scratch indices to physical IDs; callers must refill them before the next
+    launch, as in the normal symmetric-buffer contract.
+    """
     _C.nvfp4_mega_moe(
         y,
         l1_weights, l2_weights,
@@ -213,7 +225,8 @@ def nvfp4_mega_moe(y: torch.Tensor,
         recipe,
         activation, activation_clamp,
         fast_math,
-        sym_buffer.num_ring_tokens
+        sym_buffer.num_ring_tokens,
+        expert_routing_map
     )
 
 def bf16_mega_moe(y: torch.Tensor,

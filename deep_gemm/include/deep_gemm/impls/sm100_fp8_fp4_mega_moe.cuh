@@ -39,6 +39,7 @@ template <
     bool kFastMath,
     bool kUseNVFP4 = false,
     bool kUseEpochWorkspace = false,
+    bool kUseExpertRoutingMap = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -56,6 +57,10 @@ CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_fp8_fp4_mega_moe_impl(void* y,
                             int* cumulative_local_expert_recv_stats,
                             const uint32_t num_tokens,
+                            const int* expert_routing_choices,
+                            const int* expert_routing_counts,
+                            const uint32_t num_logical_experts,
+                            const uint32_t max_expert_instances,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
@@ -77,6 +82,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
     DG_STATIC_ASSERT(not kUseEpochWorkspace or kUseNVFP4,
                      "Epoch workspace is currently supported only by NVFP4 MegaMoE");
+    DG_STATIC_ASSERT(not kUseExpertRoutingMap or kUseNVFP4,
+                     "Expert routing maps are currently supported only by NVFP4 MegaMoE");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -361,7 +368,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Dispatch warps
         DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
         constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
-        const auto read_topk_idx = [&](const auto& process) {
+        const auto read_topk_idx = [&](const auto& apply_expert_routing, const auto& process) {
             // TODO: figure out better unrolling
             // Now, `unroll` is better than `unroll 8`
             #pragma unroll
@@ -371,17 +378,46 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Allocate slots for each token-topk
                 int expert_idx = -1;
                 if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
+                    const uint32_t token_topk_idx = i * kNumTopk + lane_idx;
+                    auto topk_idx_ptr =
+                        input_topk_idx_buffer.get_base_ptr<int64_t>() + token_topk_idx;
                     expert_idx = static_cast<int>(
-                        __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
-                    if (expert_idx >= 0)
-                        process(i * kNumTopk + lane_idx, expert_idx);
+                        __ldg(topk_idx_ptr));
+                    if (expert_idx >= 0) {
+                        if constexpr (
+                            kUseExpertRoutingMap and
+                            std::decay_t<decltype(apply_expert_routing)>::value
+                        ) {
+                            DG_DEVICE_ASSERT(expert_routing_choices != nullptr);
+                            DG_DEVICE_ASSERT(expert_routing_counts != nullptr);
+                            DG_DEVICE_ASSERT(static_cast<uint32_t>(expert_idx) < num_logical_experts);
+                            const int num_instances = __ldg(expert_routing_counts + expert_idx);
+                            DG_DEVICE_ASSERT(num_instances > 0);
+                            DG_DEVICE_ASSERT(static_cast<uint32_t>(num_instances) <= max_expert_instances);
+                            uint32_t instance_idx = 0;
+                            if (num_instances > 1) {
+                                const uint32_t global_token_idx =
+                                    sym_buffer.rank_idx * num_tokens + token_topk_idx / kNumTopk;
+                                instance_idx = global_token_idx % static_cast<uint32_t>(num_instances);
+                            }
+                            expert_idx = __ldg(
+                                expert_routing_choices +
+                                expert_idx * max_expert_instances + instance_idx);
+                            DG_DEVICE_ASSERT(expert_idx >= 0 and expert_idx < static_cast<int>(kNumExperts));
+                            // The registered top-k buffer is launch scratch.
+                            // Cache the physical ID so the metadata scan below
+                            // does not repeat table loads and route selection.
+                            *topk_idx_ptr = static_cast<int64_t>(expert_idx);
+                        }
+                        process(token_topk_idx, expert_idx);
+                    }
                 }
                 __syncwarp();
             }
         };
 
         // Count experts' tokens
-        read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
+        read_topk_idx(std::true_type{}, [&](const uint32_t& token_topk_idx, const int& expert_idx) {
            atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
         });
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
@@ -396,7 +432,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Write source indices (~2 us with 512 tokens)
-        read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
+        read_topk_idx(std::false_type{}, [&](const uint32_t& token_topk_idx, const int& expert_idx) {
             const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
             const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
             const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(

@@ -172,7 +172,8 @@ static void low_precision_mega_moe(
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
     const int& num_ring_tokens,
-    const bool& use_nvfp4
+    const bool& use_nvfp4,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& expert_routing_map
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -218,6 +219,33 @@ static void low_precision_mega_moe(
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
     }
 
+    // Optional logical-to-physical expert routing.  This is deliberately a
+    // compact, persistent device table: placement and weight replication stay
+    // outside the per-token critical path, while the route selection itself is
+    // fused into dispatch.
+    const int* expert_routing_choices_ptr = nullptr;
+    const int* expert_routing_counts_ptr = nullptr;
+    int num_logical_experts = 0;
+    int max_expert_instances = 0;
+    if (expert_routing_map.has_value()) {
+        DG_HOST_ASSERT(use_nvfp4 and "Expert routing maps are supported only by NVFP4 MegaMoE");
+        const auto& [choices, counts] = expert_routing_map.value();
+        DG_HOST_ASSERT(choices.scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(counts.scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(choices.is_cuda() and counts.is_cuda());
+        DG_HOST_ASSERT(choices.is_contiguous() and counts.is_contiguous());
+        DG_HOST_ASSERT(choices.dim() == 2 and counts.dim() == 1);
+        DG_HOST_ASSERT(choices.size(0) == counts.size(0));
+        DG_HOST_ASSERT(choices.get_device() == l1_weights.get_device());
+        DG_HOST_ASSERT(counts.get_device() == l1_weights.get_device());
+        num_logical_experts = static_cast<int>(choices.size(0));
+        max_expert_instances = static_cast<int>(choices.size(1));
+        DG_HOST_ASSERT(num_logical_experts > 0 and num_logical_experts <= num_experts);
+        DG_HOST_ASSERT(max_expert_instances > 0);
+        expert_routing_choices_ptr = choices.data_ptr<int>();
+        expert_routing_counts_ptr = counts.data_ptr<int>();
+    }
+
     // Check buffer bytes
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
@@ -245,7 +273,11 @@ static void low_precision_mega_moe(
                                num_experts_per_rank,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, fast_math, use_nvfp4);
+                               activation_clamp, fast_math, use_nvfp4,
+                               expert_routing_choices_ptr,
+                               expert_routing_counts_ptr,
+                               num_logical_experts,
+                               max_expert_instances);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -277,7 +309,7 @@ static void fp8_fp4_mega_moe(
         sym_buffer, sym_buffer_ptrs, rank_idx,
         num_max_tokens_per_rank, num_experts, num_topk,
         recipe, activation, activation_clamp_opt, fast_math,
-        num_ring_tokens, false);
+        num_ring_tokens, false, std::nullopt);
 }
 
 static void nvfp4_mega_moe(
@@ -293,7 +325,8 @@ static void nvfp4_mega_moe(
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
-    const int& num_ring_tokens
+    const int& num_ring_tokens,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& expert_routing_map
 ) {
     low_precision_mega_moe(
         y, l1_weights_tuple, l2_weights_tuple,
@@ -301,7 +334,7 @@ static void nvfp4_mega_moe(
         sym_buffer, sym_buffer_ptrs, rank_idx,
         num_max_tokens_per_rank, num_experts, num_topk,
         recipe, activation, activation_clamp_opt, fast_math,
-        num_ring_tokens, true);
+        num_ring_tokens, true, expert_routing_map);
 }
 
 static void bf16_mega_moe(

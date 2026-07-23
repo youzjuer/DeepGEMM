@@ -7,6 +7,7 @@
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
 #include "apis/mega.hpp"
+#include "apis/route_guard.hpp"
 #include "apis/runtime.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
@@ -24,5 +25,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     deep_gemm::gemm::register_apis(m);
     deep_gemm::layout::register_apis(m);
     deep_gemm::mega::register_apis(m);
+    deep_gemm::route_guard::register_apis(m);
     deep_gemm::runtime::register_apis(m);
 }

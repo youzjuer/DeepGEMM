@@ -252,3 +252,11 @@ def bf16_mega_moe(y: torch.Tensor,
         fast_math,
         sym_buffer.num_ring_tokens
     )
+
+
+from .scheduler import (
+    PersistentReplicaAutoScheduler,
+    PersistentReplicaGuardMetrics,
+    PersistentReplicaRouteGuard,
+    PersistentReplicaStepResult,
+)

@@ -10,6 +10,7 @@
 
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
+#include <deep_gemm/profiling/mega_moe.cuh>
 
 #include "../heuristics/mega_moe.hpp"
 
@@ -28,6 +29,7 @@ public:
         bool use_nvfp4;
         bool use_epoch_workspace;
         bool use_expert_routing_map;
+        bool enable_kernel_profile;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -38,6 +40,7 @@ public:
         const int* expert_routing_counts;
         int num_logical_experts;
         int max_expert_instances;
+        uint64_t* kernel_profile;
         layout::SymBuffer<> sym_buffer_ptrs;
 
         // Tensormap
@@ -80,6 +83,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -100,7 +104,8 @@ static void __instantiate_kernel() {{
     args.fast_math ? "true" : "false",
     args.use_nvfp4 ? "true" : "false",
     args.use_epoch_workspace ? "true" : "false",
-    args.use_expert_routing_map ? "true" : "false");
+    args.use_expert_routing_map ? "true" : "false",
+    args.enable_kernel_profile ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -113,6 +118,7 @@ static void __instantiate_kernel() {{
             args.expert_routing_counts,
             args.num_logical_experts,
             args.max_expert_instances,
+            args.kernel_profile,
             args.sym_buffer_ptrs,
             args.tensor_map_l1_acts,
             args.tensor_map_l1_acts_sf,
@@ -145,7 +151,8 @@ static void sm100_fp8_fp4_mega_moe(
     const int* expert_routing_choices,
     const int* expert_routing_counts,
     const int& num_logical_experts,
-    const int& max_expert_instances
+    const int& max_expert_instances,
+    uint64_t* kernel_profile
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -231,6 +238,7 @@ static void sm100_fp8_fp4_mega_moe(
     const bool use_epoch_workspace = use_nvfp4 and
         get_env<int>("DG_NVFP4_MEGAMOE_EPOCH_WORKSPACE", 0) != 0;
     const bool use_expert_routing_map = expert_routing_choices != nullptr;
+    const bool enable_kernel_profile = kernel_profile != nullptr;
     const SM100FP8FP4MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
@@ -241,6 +249,7 @@ static void sm100_fp8_fp4_mega_moe(
         .use_nvfp4 = use_nvfp4,
         .use_epoch_workspace = use_epoch_workspace,
         .use_expert_routing_map = use_expert_routing_map,
+        .enable_kernel_profile = enable_kernel_profile,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -249,6 +258,7 @@ static void sm100_fp8_fp4_mega_moe(
         .expert_routing_counts = expert_routing_counts,
         .num_logical_experts = num_logical_experts,
         .max_expert_instances = max_expert_instances,
+        .kernel_profile = kernel_profile,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .tensor_map_l1_acts = tensor_map_l1_acts,
         .tensor_map_l1_acts_sf = tensor_map_l1_acts_sf,

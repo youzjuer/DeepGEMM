@@ -17,6 +17,7 @@
 #include <deep_gemm/ptx/tcgen05.cuh>
 #include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
+#include <deep_gemm/profiling/mega_moe.cuh>
 
 namespace deep_gemm {
 
@@ -40,6 +41,7 @@ template <
     bool kUseNVFP4 = false,
     bool kUseEpochWorkspace = false,
     bool kUseExpertRoutingMap = false,
+    bool kEnableKernelProfile = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -61,6 +63,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const int* expert_routing_counts,
                             const uint32_t num_logical_experts,
                             const uint32_t max_expert_instances,
+                            uint64_t* kernel_profile,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
@@ -84,6 +87,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                      "Epoch workspace is currently supported only by NVFP4 MegaMoE");
     DG_STATIC_ASSERT(not kUseExpertRoutingMap or kUseNVFP4,
                      "Expert routing maps are currently supported only by NVFP4 MegaMoE");
+    DG_STATIC_ASSERT(not kEnableKernelProfile or kUseNVFP4,
+                     "Kernel profiling is currently supported only by NVFP4 MegaMoE");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -91,6 +96,59 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const uint32_t thread_idx = threadIdx.x;
     const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx = ptx::get_lane_idx();
+
+    // Optional device-side timeline.  The JIT specializes this entire block
+    // away for normal launches, leaving the production kernel unchanged.
+    using ProfileLayout = profile::MegaMoEKernelProfileLayout;
+    DG_STATIC_ASSERT(kNumThreads / 32 <= ProfileLayout::kMaxWarps,
+                     "MegaMoE profile layout has too few warp slots");
+    uint32_t profile_compute_count = 0;
+    uint32_t profile_communication_count = 0;
+    uint64_t* cta_profile = nullptr;
+    if constexpr (kEnableKernelProfile) {
+        DG_DEVICE_ASSERT(kernel_profile != nullptr);
+        cta_profile = kernel_profile +
+            static_cast<uint64_t>(sm_idx) * ProfileLayout::kWordsPerCTA;
+    }
+    const auto profile_now = [&]() -> uint64_t {
+        if constexpr (kEnableKernelProfile) {
+            if (lane_idx == 0)
+                return profile::read_globaltimer();
+        }
+        return 0;
+    };
+    const auto profile_mark_overflow = [&]() {
+        if constexpr (kEnableKernelProfile) {
+            if (lane_idx == 0)
+                cta_profile[ProfileLayout::kOverflowOffset] = 1;
+        }
+    };
+    const auto profile_append_interval = [&](const ProfileLayout::IntervalKind kind,
+                                             const ProfileLayout::IntervalStage stage,
+                                             const uint64_t start,
+                                             const uint64_t end) {
+        if constexpr (kEnableKernelProfile) {
+            if (lane_idx == 0) {
+                auto& count = kind == ProfileLayout::Compute ?
+                    profile_compute_count : profile_communication_count;
+                if (count < ProfileLayout::kMaxIntervalsPerWarp) {
+                    cta_profile[ProfileLayout::get_interval_offset(
+                        kind, warp_idx, count, false)] =
+                            ProfileLayout::encode_stage(start, stage);
+                    cta_profile[ProfileLayout::get_interval_offset(
+                        kind, warp_idx, count, true)] = end;
+                } else {
+                    profile_mark_overflow();
+                }
+                ++ count;
+            }
+        }
+    };
+    if constexpr (kEnableKernelProfile) {
+        if (lane_idx == 0)
+            cta_profile[ProfileLayout::get_kernel_offset(warp_idx, false)] =
+                profile::read_globaltimer();
+    }
 
     // Prefetch TMA descriptors at the very beginning
     if (warp_idx == 0) {
@@ -432,6 +490,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Write source indices (~2 us with 512 tokens)
+        const auto profile_metadata_start = profile_now();
         read_topk_idx(std::false_type{}, [&](const uint32_t& token_topk_idx, const int& expert_idx) {
             const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
             const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
@@ -439,12 +498,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
             *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
         });
+        profile_append_interval(
+            ProfileLayout::Communication, ProfileLayout::RouteMetadata,
+            profile_metadata_start, profile_now());
 
         // Grid sync
         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
             workspace, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
         );
+
+        // Publish expert counts and wait until every rank can safely pull.
+        const auto profile_publish_start = profile_now();
 
         // Write expert count
         if (sm_idx == 0) {
@@ -483,6 +548,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 /* After the NVLink barrier, there is a grid sync */ true
             );
         }
+        profile_append_interval(
+            ProfileLayout::Communication, ProfileLayout::DispatchPublishBarrier,
+            profile_publish_start, profile_now());
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -608,6 +676,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
             }
 
+            const bool profile_is_remote_pull =
+                current_rank_in_expert_idx != sym_buffer.rank_idx;
+            const auto profile_pull_start = profile_now();
+
             const auto src_base_ptr = sym_buffer.map(
                 input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
             const auto dst_base_ptr = l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
@@ -674,6 +746,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 );
             }
             __syncwarp();
+            if (profile_is_remote_pull)
+                profile_append_interval(
+                    ProfileLayout::Communication,
+                    ProfileLayout::RemotePull,
+                    profile_pull_start, profile_now());
         }
 
         // The epilogue reaches this handoff after publishing all remote L2
@@ -732,6 +809,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         if constexpr (not kUseEpochWorkspace) {
             // Wait for all ranks to finish cleaning
+            const auto profile_cleanup_barrier_start = profile_now();
             comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                                  kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
                 workspace, sym_buffer, sm_idx, thread_idx,
@@ -739,12 +817,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 /* Before the NVLink barrier, there is a grid sync */ true,
                 /* At the end of kernel does not need to sync */ false
             );
+            profile_append_interval(
+                ProfileLayout::Communication,
+                ProfileLayout::CleanupBarrier,
+                profile_cleanup_barrier_start, profile_now());
         }
     } else if (warp_idx == kNumDispatchWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // GEMM TMA load warp for tokens with SFA
+        uint32_t profile_block_idx = 0;
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -770,6 +853,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto ptr = workspace.get_l2_full_count_ptr(ring_block_idx);
                 const auto num_expected_blocks = (L2_SHAPE_K / BLOCK_N) * 2 * (pool_block_idx / kNumRingBlocks + 1);
                 while (ptx::ld_acq(ptr) != num_expected_blocks);
+            }
+
+            if constexpr (kEnableKernelProfile) {
+                if (lane_idx == 0) {
+                    if (profile_block_idx < ProfileLayout::kMaxBlocksPerCTA) {
+                        cta_profile[ProfileLayout::get_block_offset(
+                            profile_block_idx, false)] = ProfileLayout::encode_stage(
+                                profile::read_globaltimer(),
+                                block_phase == sched::BlockPhase::Linear2 ?
+                                    ProfileLayout::GemmL2 : ProfileLayout::GemmL1);
+                    } else {
+                        profile_mark_overflow();
+                    }
+                }
             }
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
@@ -811,7 +908,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
             }
+            ++ profile_block_idx;
         });
+        if constexpr (kEnableKernelProfile) {
+            if (lane_idx == 0)
+                cta_profile[ProfileLayout::kBlockStartCountOffset] = profile_block_idx;
+        }
     } else if (warp_idx == kNumDispatchWarps + 1) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -1080,6 +1182,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Persistently schedule over blocks
         uint32_t current_iter_idx = 0;
+        uint32_t profile_block_idx = 0;
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -1089,6 +1192,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
             shared_storage.tmem_full_barriers[accum_stage_idx].wait(accum_phase);
             ptx::tcgen05_after_thread_sync();
+
+            if constexpr (kEnableKernelProfile) {
+                if (epilogue_warp_idx == 0 and lane_idx == 0) {
+                    if (profile_block_idx < ProfileLayout::kMaxBlocksPerCTA) {
+                        cta_profile[ProfileLayout::get_block_offset(
+                            profile_block_idx, true)] = profile::read_globaltimer();
+                    } else {
+                        profile_mark_overflow();
+                    }
+                }
+            }
+            const auto profile_epilogue_start = profile_now();
 
             // Compute offsets
             // NOTES: use shuffle here to let NVCC know warp divergence won't happen
@@ -1359,6 +1474,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
                 }
                 __syncwarp();
+                if (warp_idx_in_wg == 0)
+                    profile_append_interval(
+                        ProfileLayout::Compute,
+                        ProfileLayout::EpilogueL1,
+                        profile_epilogue_start, profile_now());
             } else {
                 // Increment L2 empty count for this physical slot (one per N block)
                 if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
@@ -1380,6 +1500,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
                         break;
                     }
+
+                    const auto profile_l2_compute_start =
+                        s == 0 ? profile_epilogue_start : profile_now();
 
                     #pragma unroll
                     for (uint32_t i = 0; i < STORE_BLOCK_M / ATOM_M; ++ i) {
@@ -1424,11 +1547,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                     // Wait shared memory ready
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+                    if (warp_idx_in_wg == 0)
+                        profile_append_interval(
+                            ProfileLayout::Compute,
+                            ProfileLayout::EpilogueL2,
+                            profile_l2_compute_start, profile_now());
 
                     // Write into remote buffers
                     // Each warp writes 2 rows (lane_idx/16 splits the warp into two halves, one per row)
                     const uint32_t row_in_atom = (warp_idx_in_wg * 2 + lane_idx / 16) % ATOM_M;
                     const uint32_t bank_group_idx = lane_idx % 8;
+                    const auto profile_output_push_start = profile_now();
+                    bool profile_wrote_remote = false;
 
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
@@ -1443,6 +1573,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const uint32_t dst_rank_idx = src_metadata.rank_idx;
                         const uint32_t dst_token_idx = src_metadata.token_idx;
                         const uint32_t dst_topk_idx = src_metadata.topk_idx;
+                        if constexpr (kEnableKernelProfile)
+                            profile_wrote_remote |= dst_rank_idx != sym_buffer.rank_idx;
 
                         // Read from shared memory
                         const auto smem_ptr = reinterpret_cast<uint8_t*>(shared_storage.smem_d.l2[epilogue_wg_idx]) +
@@ -1459,12 +1591,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
                         *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                     }
+                    if constexpr (kEnableKernelProfile) {
+                        const bool profile_any_remote =
+                            __any_sync(0xffffffff, profile_wrote_remote);
+                        profile_append_interval(
+                            profile_any_remote ? ProfileLayout::Communication :
+                                                 ProfileLayout::Compute,
+                            profile_any_remote ? ProfileLayout::RemoteOutputPush :
+                                                 ProfileLayout::EpilogueL2,
+                            profile_output_push_start, profile_now());
+                    }
                 }
 
                 // Ensure the next epilogue safe to use shared memory
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             }
+            ++ profile_block_idx;
         });
+        if constexpr (kEnableKernelProfile) {
+            if (epilogue_warp_idx == 0 and lane_idx == 0)
+                cta_profile[ProfileLayout::kBlockEndCountOffset] = profile_block_idx;
+        }
 
         // Deallocate tensor memory
         // NOTES: must be called by the same logical warp ID on both CTAs
@@ -1472,6 +1619,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             Allocator().free(0, kNumTmemCols);
 
         // NVLink barrier (grid sync + cross-rank signal + grid sync): ~4 us
+        const auto profile_combine_barrier_start = profile_now();
         if constexpr (kUseEpochWorkspace) {
             comm::nvlink_epoch_barrier<
                 kNumRanks, kNumSMs, kNumEpilogueThreads,
@@ -1487,6 +1635,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
             );
         }
+        profile_append_interval(
+            ProfileLayout::Communication,
+            ProfileLayout::CombineBarrier,
+            profile_combine_barrier_start, profile_now());
 
         // Start active-bank cleanup after output publication and overlap it
         // with combine. Epoch mode reuses this bank only two launches later;
@@ -1540,6 +1692,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
              token_idx < num_tokens;
              token_idx += kNumSMs * kNumEpilogueWarps) {
+            const auto profile_combine_start = profile_now();
             // Read top-k slot indices: each lane reads one slot, then broadcast via exchange
             DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
@@ -1625,6 +1778,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
             }
+            profile_append_interval(
+                ProfileLayout::Compute,
+                ProfileLayout::Combine,
+                profile_combine_start, profile_now());
+        }
+    }
+
+    if constexpr (kEnableKernelProfile) {
+        if (lane_idx == 0) {
+            cta_profile[ProfileLayout::get_counter_offset(
+                ProfileLayout::Compute, warp_idx)] = profile_compute_count;
+            cta_profile[ProfileLayout::get_counter_offset(
+                ProfileLayout::Communication, warp_idx)] =
+                    profile_communication_count;
+            cta_profile[ProfileLayout::get_kernel_offset(warp_idx, true)] =
+                profile::read_globaltimer();
         }
     }
 #else

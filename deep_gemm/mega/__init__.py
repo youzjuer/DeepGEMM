@@ -112,6 +112,55 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
     )
 
 
+def get_mega_moe_kernel_profile_layout() -> dict[str, int]:
+    """Return the stable device-timeline layout used by NVFP4 MegaMoE."""
+    values = _C.get_mega_moe_kernel_profile_layout()
+    keys = (
+        'max_warps',
+        'max_blocks_per_cta',
+        'max_intervals_per_warp',
+        'kernel_offset',
+        'block_offset',
+        'compute_offset',
+        'communication_offset',
+        'counter_offset',
+        'block_start_count_offset',
+        'block_end_count_offset',
+        'overflow_offset',
+        'words_per_cta',
+        'stage_shift',
+        'timestamp_mask',
+        'stage_gemm_l1',
+        'stage_gemm_l2',
+        'stage_epilogue_l1',
+        'stage_epilogue_l2',
+        'stage_combine',
+        'stage_route_metadata',
+        'stage_dispatch_publish_barrier',
+        'stage_remote_pull',
+        'stage_cleanup_barrier',
+        'stage_remote_output_push',
+        'stage_combine_barrier',
+    )
+    return dict(zip(keys, map(int, values)))
+
+
+def allocate_mega_moe_kernel_profile() -> torch.Tensor:
+    """Allocate a zeroed timeline buffer for one profiled MegaMoE launch.
+
+    The caller must clear the tensor before every reuse. Passing ``None`` to
+    :func:`nvfp4_mega_moe` selects the normal JIT specialization with all
+    timeline code compiled out.
+    """
+    layout = get_mega_moe_kernel_profile_layout()
+    num_sms = _C.get_num_sms()
+    return torch.zeros(
+        (num_sms, layout['words_per_cta']),
+        dtype=torch.int64,
+        device='cuda',
+    )
+
+
 def _interleave_weights(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
     # [gate: 0..7, up: 0..7, gate: 8..15, up: 8..15, ...] instead of [gate | up]
     g, n, *rest = t.shape
@@ -202,7 +251,8 @@ def nvfp4_mega_moe(y: torch.Tensor,
                     activation: str = 'swiglu',
                     activation_clamp: Optional[float] = None,
                     fast_math: bool = True,
-                    expert_routing_map: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
+                    expert_routing_map: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                    kernel_profile: Optional[torch.Tensor] = None):
     """Run fused NVFP4 MegaMoE.
 
     ``expert_routing_map`` optionally contains ``(choices, counts)``.  Choices
@@ -213,6 +263,10 @@ def nvfp4_mega_moe(y: torch.Tensor,
     physical instance for each route.  Dispatch rewrites those registered
     scratch indices to physical IDs; callers must refill them before the next
     launch, as in the normal symmetric-buffer contract.
+
+    ``kernel_profile`` optionally enables the device-side timeline profiler.
+    Allocate it with :func:`allocate_mega_moe_kernel_profile`, zero it before
+    each reuse, and do not use profiled launches for production timing.
     """
     _C.nvfp4_mega_moe(
         y,
@@ -226,7 +280,8 @@ def nvfp4_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math,
         sym_buffer.num_ring_tokens,
-        expert_routing_map
+        expert_routing_map,
+        kernel_profile
     )
 
 def bf16_mega_moe(y: torch.Tensor,

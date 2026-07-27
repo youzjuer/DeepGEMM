@@ -13,10 +13,43 @@
 #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
 
+#include <deep_gemm/profiling/mega_moe.cuh>
+
 namespace deep_gemm::mega {
 
 static int get_token_alignment_for_mega_moe() {
     return layout::kLCMCandidateBlockM;
+}
+
+static std::vector<int64_t> get_mega_moe_kernel_profile_layout() {
+    using Layout = profile::MegaMoEKernelProfileLayout;
+    return {
+        Layout::kMaxWarps,
+        Layout::kMaxBlocksPerCTA,
+        Layout::kMaxIntervalsPerWarp,
+        Layout::kKernelOffset,
+        Layout::kBlockOffset,
+        Layout::kComputeOffset,
+        Layout::kCommunicationOffset,
+        Layout::kCounterOffset,
+        Layout::kBlockStartCountOffset,
+        Layout::kBlockEndCountOffset,
+        Layout::kOverflowOffset,
+        Layout::kWordsPerCTA,
+        Layout::kStageShift,
+        static_cast<int64_t>(Layout::kTimestampMask),
+        Layout::GemmL1,
+        Layout::GemmL2,
+        Layout::EpilogueL1,
+        Layout::EpilogueL2,
+        Layout::Combine,
+        Layout::RouteMetadata,
+        Layout::DispatchPublishBarrier,
+        Layout::RemotePull,
+        Layout::CleanupBarrier,
+        Layout::RemoteOutputPush,
+        Layout::CombineBarrier,
+    };
 }
 
 static std::pair<int, int> get_ring_limit_for_mega_moe(
@@ -173,7 +206,8 @@ static void low_precision_mega_moe(
     const bool& fast_math,
     const int& num_ring_tokens,
     const bool& use_nvfp4,
-    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& expert_routing_map
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& expert_routing_map,
+    const std::optional<torch::Tensor>& kernel_profile
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -217,6 +251,22 @@ static void low_precision_mega_moe(
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
+    }
+
+    // Optional device-side timeline buffer. The enabled state is a JIT
+    // specialization so the production path has no profiling instructions.
+    uint64_t* kernel_profile_ptr = nullptr;
+    if (kernel_profile.has_value()) {
+        using ProfileLayout = profile::MegaMoEKernelProfileLayout;
+        DG_HOST_ASSERT(use_nvfp4 and "Kernel profiling is supported only by NVFP4 MegaMoE");
+        DG_HOST_ASSERT(kernel_profile->scalar_type() == torch::kInt64);
+        DG_HOST_ASSERT(kernel_profile->is_cuda());
+        DG_HOST_ASSERT(kernel_profile->is_contiguous());
+        DG_HOST_ASSERT(kernel_profile->get_device() == l1_weights.get_device());
+        DG_HOST_ASSERT(kernel_profile->numel() >= static_cast<int64_t>(
+            ProfileLayout::get_required_numel(device_runtime->get_num_sms())));
+        kernel_profile_ptr = reinterpret_cast<uint64_t*>(
+            kernel_profile->data_ptr<int64_t>());
     }
 
     // Optional logical-to-physical expert routing.  This is deliberately a
@@ -277,7 +327,8 @@ static void low_precision_mega_moe(
                                expert_routing_choices_ptr,
                                expert_routing_counts_ptr,
                                num_logical_experts,
-                               max_expert_instances);
+                               max_expert_instances,
+                               kernel_profile_ptr);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -309,7 +360,7 @@ static void fp8_fp4_mega_moe(
         sym_buffer, sym_buffer_ptrs, rank_idx,
         num_max_tokens_per_rank, num_experts, num_topk,
         recipe, activation, activation_clamp_opt, fast_math,
-        num_ring_tokens, false, std::nullopt);
+        num_ring_tokens, false, std::nullopt, std::nullopt);
 }
 
 static void nvfp4_mega_moe(
@@ -326,7 +377,8 @@ static void nvfp4_mega_moe(
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
     const int& num_ring_tokens,
-    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& expert_routing_map
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& expert_routing_map,
+    const std::optional<torch::Tensor>& kernel_profile
 ) {
     low_precision_mega_moe(
         y, l1_weights_tuple, l2_weights_tuple,
@@ -334,7 +386,7 @@ static void nvfp4_mega_moe(
         sym_buffer, sym_buffer_ptrs, rank_idx,
         num_max_tokens_per_rank, num_experts, num_topk,
         recipe, activation, activation_clamp_opt, fast_math,
-        num_ring_tokens, true, expert_routing_map);
+        num_ring_tokens, true, expert_routing_map, kernel_profile);
 }
 
 static void bf16_mega_moe(
@@ -420,6 +472,7 @@ static void bf16_mega_moe(
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
+    m.def("get_mega_moe_kernel_profile_layout", &get_mega_moe_kernel_profile_layout);
     m.def("get_ring_limit_for_mega_moe", &get_ring_limit_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);

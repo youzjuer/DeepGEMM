@@ -84,6 +84,8 @@ except ImportError:
 from .mega import (
     SymmBuffer,
     get_symm_buffer_for_mega_moe,
+    get_mega_moe_kernel_profile_layout,
+    allocate_mega_moe_kernel_profile,
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,
     nvfp4_mega_moe,

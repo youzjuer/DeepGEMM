@@ -29,6 +29,7 @@ public:
         bool use_nvfp4;
         bool use_epoch_workspace;
         bool use_expert_routing_map;
+        int dispatch_ready_mode;
         bool enable_kernel_profile;
         MegaMoEConfig config;
 
@@ -84,6 +85,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -105,6 +107,7 @@ static void __instantiate_kernel() {{
     args.use_nvfp4 ? "true" : "false",
     args.use_epoch_workspace ? "true" : "false",
     args.use_expert_routing_map ? "true" : "false",
+    args.dispatch_ready_mode,
     args.enable_kernel_profile ? "true" : "false");
     }
 
@@ -238,6 +241,10 @@ static void sm100_fp8_fp4_mega_moe(
     const bool use_epoch_workspace = use_nvfp4 and
         get_env<int>("DG_NVFP4_MEGAMOE_EPOCH_WORKSPACE", 0) != 0;
     const bool use_expert_routing_map = expert_routing_choices != nullptr;
+    const int dispatch_ready_mode = use_nvfp4 ?
+        get_env<int>("DG_NVFP4_MEGAMOE_DISPATCH_READY_MODE", 0) : 0;
+    DG_HOST_ASSERT(0 <= dispatch_ready_mode and dispatch_ready_mode <= 4);
+    DG_HOST_ASSERT(dispatch_ready_mode == 0 or use_epoch_workspace);
     const bool enable_kernel_profile = kernel_profile != nullptr;
     const SM100FP8FP4MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
@@ -249,6 +256,7 @@ static void sm100_fp8_fp4_mega_moe(
         .use_nvfp4 = use_nvfp4,
         .use_epoch_workspace = use_epoch_workspace,
         .use_expert_routing_map = use_expert_routing_map,
+        .dispatch_ready_mode = dispatch_ready_mode,
         .enable_kernel_profile = enable_kernel_profile,
         .config = config,
         .y = y.data_ptr(),

@@ -41,6 +41,7 @@ template <
     bool kUseNVFP4 = false,
     bool kUseEpochWorkspace = false,
     bool kUseExpertRoutingMap = false,
+    uint32_t kDispatchReadyMode = 0,
     bool kEnableKernelProfile = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -87,6 +88,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                      "Epoch workspace is currently supported only by NVFP4 MegaMoE");
     DG_STATIC_ASSERT(not kUseExpertRoutingMap or kUseNVFP4,
                      "Expert routing maps are currently supported only by NVFP4 MegaMoE");
+    DG_STATIC_ASSERT(kDispatchReadyMode <= 4,
+                     "Unsupported dispatch readiness mode");
+    DG_STATIC_ASSERT(kDispatchReadyMode == 0 or (kUseNVFP4 and kUseEpochWorkspace),
+                     "Barrierless dispatch readiness requires NVFP4 epoch workspace");
     DG_STATIC_ASSERT(not kEnableKernelProfile or kUseNVFP4,
                      "Kernel profiling is currently supported only by NVFP4 MegaMoE");
 
@@ -291,6 +296,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         Barrier combine_barriers[kNumEpilogueWarps * 2];
         uint32_t tmem_ptr_in_smem;
         uint32_t metadata_bank_idx;
+        uint32_t barrier_generation;
     };
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
@@ -327,6 +333,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             );
             const auto barrier_generation = ptx::ld_acq(
                 workspace_layout.get_nvl_barrier_counter_ptr());
+            shared_storage.barrier_generation = barrier_generation;
             shared_storage.metadata_bank_idx = kUseEpochWorkspace ?
                 ((barrier_generation >> 1) & 1u) : 0u;
         }
@@ -380,7 +387,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank,
         kNumExpertsPerWave,
-        kNumSMs, kNumRanks>(workspace);
+        kNumSMs, kNumRanks,
+        kDispatchReadyMode>(
+            workspace, shared_storage.expert_token_count);
 
     // MMA pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
@@ -397,6 +406,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kDispatchWithEpilogueBarrierIdx = 1;
     constexpr uint32_t kEpilogueFullBarrierIdx = 2;
     constexpr uint32_t kEpilogueWGBarrierStartIdx = 3;
+    constexpr uint32_t kDispatchReadyCacheBarrierIdx =
+        kEpilogueWGBarrierStartIdx + kNumEpilogueWarpgroups;
+    DG_STATIC_ASSERT(kDispatchReadyCacheBarrierIdx < 16,
+                     "Insufficient named barriers for readiness cache");
 
     // NVLink barrier tags
     constexpr uint32_t kBeforeDispatchPullBarrierTag = 1;
@@ -517,19 +530,49 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
                 const auto dst_rank_idx = i / kNumExpertsPerRank;
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
-                const auto expert_status = *workspace.get_expert_send_count_ptr(i);
+                const auto expert_count = *workspace.get_expert_send_count_ptr(i);
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
-                    dst_rank_idx) = expert_status & 0xffffffff;
-                ptx::atomic_add_sys(
-                    sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
-                    expert_status);
+                    dst_rank_idx) = expert_count & 0xffffffff;
+                const auto recv_sum_ptr = sym_buffer.map(
+                    workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx),
+                    dst_rank_idx);
+                if constexpr (kDispatchReadyMode == 1 or
+                              kDispatchReadyMode == 2 or
+                              kDispatchReadyMode == 3)
+                    ptx::atomic_add_rel_sys(recv_sum_ptr, expert_count);
+                else
+                    ptx::atomic_add_sys(recv_sum_ptr, expert_count);
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Barrier before pulling
-        if constexpr (kUseEpochWorkspace) {
+        if constexpr (kDispatchReadyMode == 1 or
+                      kDispatchReadyMode == 2 or
+                      kDispatchReadyMode == 4) {
+            // Epoch mode normally advances its generation twice per launch,
+            // once at each cross-rank barrier. Keep barrier #1's monotonic
+            // signal/counter arrive so candidate and baseline launches can
+            // share a workspace, but do not wait for remote arrivals or
+            // broadcast completion to 148 CTAs. Modes 1/2 use per-expert
+            // completion; mode 4 lets each CTA wait on tag-1 directly.
+            if (sm_idx == 0) {
+                auto* signal_ptr = reinterpret_cast<uint32_t*>(
+                    workspace.get_nvl_barrier_signal_ptr(
+                        kBeforeDispatchPullBarrierTag - 1));
+                if (thread_idx < kNumRanks)
+                    ptx::red_add_rel_sys(
+                        reinterpret_cast<uint32_t*>(
+                            sym_buffer.map(signal_ptr, thread_idx)),
+                        1u);
+                ptx::sync_aligned(
+                    kNumDispatchThreads, kDispatchBarrierIdx);
+                if (thread_idx == 0)
+                    ptx::red_add(
+                        workspace.get_nvl_barrier_counter_ptr(), 1u);
+            }
+        } else if constexpr (kUseEpochWorkspace) {
             comm::nvlink_epoch_barrier<
                 kNumRanks, kNumSMs, kNumDispatchThreads,
                 kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
@@ -548,8 +591,42 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 /* After the NVLink barrier, there is a grid sync */ true
             );
         }
+        if constexpr (kDispatchReadyMode == 4) {
+            // Every rank releases tag-1 only after publishing all expert
+            // counts and route metadata. One acquire per CTA therefore makes
+            // the whole publication visible. Warp 0 then snapshots local
+            // expert counts in retired dispatch SMEM; the CTA barrier carries
+            // that visibility to every scheduler role without repeating a
+            // system-scope acquire for every expert and every warp.
+            if (warp_idx == 0) {
+                auto* signal_ptr = reinterpret_cast<uint32_t*>(
+                    workspace.get_nvl_barrier_signal_ptr(
+                        kBeforeDispatchPullBarrierTag - 1));
+                if (lane_idx == 0) {
+                    const uint32_t target =
+                        (shared_storage.barrier_generation / 2u + 1u) *
+                        kNumRanks;
+                    while (ptx::ld_acq_sys(signal_ptr) != target);
+                }
+                __syncwarp();
+                for (uint32_t expert_idx = lane_idx;
+                     expert_idx < kNumExpertsPerRank;
+                     expert_idx += 32) {
+                    const auto value = ptx::ld_volatile(
+                        workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                    DG_DEVICE_ASSERT(
+                        static_cast<uint32_t>(value >> 32) ==
+                        kNumSMs * kNumRanks);
+                    shared_storage.expert_token_count[expert_idx] =
+                        static_cast<uint32_t>(value);
+                }
+            }
+            ptx::sync_unaligned(
+                kNumThreads, kDispatchReadyCacheBarrierIdx);
+        }
         profile_append_interval(
-            ProfileLayout::Communication, ProfileLayout::DispatchPublishBarrier,
+            ProfileLayout::Communication,
+            ProfileLayout::DispatchPublishBarrier,
             profile_publish_start, profile_now());
 
         // Ensure the epilogue barrier cannot run with the pull barrier
@@ -560,8 +637,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
         const auto pull_mbarrier = &shared_storage.dispatch_barriers[warp_idx];
 
-        // Cache expert token counts in registers (same pattern as scheduler)
-        scheduler.fetch_expert_recv_count();
+        // Cache expert token counts in registers. Mode 1 waits for every
+        // expert here; mode 2 acquires one scheduler wave at a time below.
+        if constexpr (kDispatchReadyMode == 0)
+            scheduler.template fetch_expert_recv_count<false>();
+        else if constexpr (kDispatchReadyMode == 1 or
+                           kDispatchReadyMode == 3)
+            scheduler.template fetch_expert_recv_count<true>();
+        else if constexpr (kDispatchReadyMode == 4)
+            scheduler.template fetch_expert_recv_count<false>();
 
         // Per-rank counts for current expert (re-loaded when expert changes)
         constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
@@ -577,6 +661,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             while (token_idx >= expert_end_idx) {
                 if (++ current_expert_idx >= kNumExpertsPerRank)
                     break;
+
+                if constexpr (kDispatchReadyMode == 2) {
+                    if (current_expert_idx % kNumExpertsPerWave == 0)
+                        scheduler.template fetch_expert_wave_recv_count<true>(
+                            current_expert_idx);
+                }
 
                 // Update pool block offset for the new expert
                 expert_pool_block_offset += math::ceil_div(expert_end_idx - expert_start_idx, BLOCK_M);
@@ -823,6 +913,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 profile_cleanup_barrier_start, profile_now());
         }
     } else if (warp_idx == kNumDispatchWarps) {
+        if constexpr (kDispatchReadyMode == 4)
+            ptx::sync_unaligned(
+                kNumThreads, kDispatchReadyCacheBarrierIdx);
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
@@ -915,6 +1008,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 cta_profile[ProfileLayout::kBlockStartCountOffset] = profile_block_idx;
         }
     } else if (warp_idx == kNumDispatchWarps + 1) {
+        if constexpr (kDispatchReadyMode == 4)
+            ptx::sync_unaligned(
+                kNumThreads, kDispatchReadyCacheBarrierIdx);
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
@@ -968,6 +1064,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         });
     } else if (warp_idx == kNumDispatchWarps + 2) {
+        if constexpr (kDispatchReadyMode == 4)
+            ptx::sync_unaligned(
+                kNumThreads, kDispatchReadyCacheBarrierIdx);
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
@@ -1142,10 +1241,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
     } else if (warp_idx == kNumDispatchWarps + 3) {
+        if constexpr (kDispatchReadyMode == 4)
+            ptx::sync_unaligned(
+                kNumThreads, kDispatchReadyCacheBarrierIdx);
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
+        if constexpr (kDispatchReadyMode == 4)
+            ptx::sync_unaligned(
+                kNumThreads, kDispatchReadyCacheBarrierIdx);
         // Adjust registers
         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
 

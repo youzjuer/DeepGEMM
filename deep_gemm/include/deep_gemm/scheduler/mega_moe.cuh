@@ -22,6 +22,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumExpertsPerRank,
           uint32_t kNumExpertsPerWave,
           uint32_t kNumSMs, uint32_t kNumRanks,
+          uint32_t kDispatchReadyMode = 0,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
@@ -42,6 +43,9 @@ struct MegaMoEScheduler {
 
     // Arrival counts
     const layout::Workspace& workspace;
+    // Mode 4 publishes one CTA-local count cache after a single cross-rank
+    // readiness acquire. Other modes continue to read the workspace directly.
+    const uint32_t* shared_num_tokens_per_expert = nullptr;
 
     // Scheduler state
     BlockPhase next_phase = BlockPhase::Linear1;
@@ -58,7 +62,11 @@ struct MegaMoEScheduler {
     // Layout: `stored_num_tokens_per_expert[i]` holds expert (i * 32 + lane_idx)'s count
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
 
-    CUTLASS_DEVICE explicit MegaMoEScheduler(const layout::Workspace& workspace): workspace(workspace) {
+    CUTLASS_DEVICE explicit MegaMoEScheduler(
+            const layout::Workspace& workspace,
+            const uint32_t* shared_num_tokens_per_expert = nullptr):
+            workspace(workspace),
+            shared_num_tokens_per_expert(shared_num_tokens_per_expert) {
         block_idx = blockIdx.x;
     }
 
@@ -92,7 +100,16 @@ struct MegaMoEScheduler {
     CUTLASS_DEVICE void advance_expert_idx() {
         current_pool_block_offset += get_current_num_m_blocks();
         current_local_expert_idx += 1;
-        current_num_tokens = get_num_tokens(current_local_expert_idx);
+        if constexpr (kDispatchReadyMode == 2) {
+            // The next wave has not acquired its completion words yet. Its
+            // first count is installed when L2 of the current wave retires.
+            current_num_tokens =
+                current_local_expert_idx < kNumExpertsPerRank and
+                current_local_expert_idx % kNumExpertsPerWave != 0 ?
+                    get_num_tokens(current_local_expert_idx) : 0u;
+        } else {
+            current_num_tokens = get_num_tokens(current_local_expert_idx);
+        }
     }
 
     CUTLASS_DEVICE void set_expert_idx(const uint32_t& expert_idx) {
@@ -174,6 +191,13 @@ struct MegaMoEScheduler {
                 } else {
                     // Move to L1 of the next wave
                     next_phase = BlockPhase::Linear1;
+                    if constexpr (kDispatchReadyMode == 2) {
+                        if (current_local_expert_idx < kNumExpertsPerRank) {
+                            fetch_expert_wave_recv_count(
+                                current_local_expert_idx);
+                            set_expert_idx(current_local_expert_idx);
+                        }
+                    }
                 }
             }
         }
@@ -182,6 +206,7 @@ struct MegaMoEScheduler {
         return {BlockPhase::None, 0, 0, 0};
     }
 
+    template <bool kAcquire = false>
     CUTLASS_DEVICE void fetch_expert_recv_count() {
         // NOTES: each lane caches experts at indices (i * 32 + lane_idx)
         #pragma unroll
@@ -189,19 +214,61 @@ struct MegaMoEScheduler {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
-                do {
-                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                if constexpr (kDispatchReadyMode == 4) {
+                    value = shared_num_tokens_per_expert[expert_idx];
+                } else {
+                    do {
+                        if constexpr (kAcquire)
+                            value = ptx::ld_acq_sys(
+                                workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                        else
+                            value = ptx::ld_volatile(
+                                workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                    } while (static_cast<uint32_t>(value >> 32) !=
+                             kNumSMs * kNumRanks);
+                }
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }
         __syncwarp();
     }
 
+    template <bool kAcquire = false>
+    CUTLASS_DEVICE void fetch_expert_wave_recv_count(
+            const uint32_t& wave_start_expert_idx) {
+        DG_DEVICE_ASSERT(wave_start_expert_idx % kNumExpertsPerWave == 0);
+        const auto wave_end_expert_idx = cute::min(
+            wave_start_expert_idx + kNumExpertsPerWave,
+            kNumExpertsPerRank);
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            const auto expert_idx = i * 32 + ptx::get_lane_idx();
+            if (expert_idx >= wave_start_expert_idx and
+                expert_idx < wave_end_expert_idx) {
+                uint64_t value = 0;
+                do {
+                    if constexpr (kAcquire)
+                        value = ptx::ld_acq_sys(
+                            workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                    else
+                        value = ptx::ld_volatile(
+                            workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                } while (static_cast<uint32_t>(value >> 32) !=
+                         kNumSMs * kNumRanks);
+                stored_num_tokens_per_expert[i] =
+                    static_cast<uint32_t>(value);
+            }
+        }
+        __syncwarp();
+    }
+
     template <typename Func>
     CUTLASS_DEVICE void for_each_block(Func&& func) {
-        // Wait for all expert counters to be finalized
-        fetch_expert_recv_count();
+        if constexpr (kDispatchReadyMode == 2)
+            fetch_expert_wave_recv_count<>(0);
+        else
+            // Wait for all expert counters to be finalized
+            fetch_expert_recv_count<>();
 
         // Initialize current expert with 0
         set_expert_idx(0);

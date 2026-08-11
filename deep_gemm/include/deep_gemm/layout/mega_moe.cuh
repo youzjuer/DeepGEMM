@@ -30,6 +30,12 @@ CUTLASS_HOST_DEVICE constexpr T get_num_sf_ring_tokens(T num_ring_tokens, T bloc
     return (num_ring_tokens / block_m) * math::constexpr_align(block_m, static_cast<T>(128));
 }
 
+// Shared L2 input SF capacity: worst-case aligned SF pages over all candidate BLOCK_M.
+template <typename T>
+CUTLASS_HOST_DEVICE constexpr T get_num_max_shared_sf_tokens(const T& num_max_tokens_per_rank) {
+    return math::constexpr_ceil_div<T>(num_max_tokens_per_rank, kMinCandidateBlockM) * 128;
+}
+
 // Per-token source metadata for combine write-back
 struct TokenSrcMetadata {
     uint32_t rank_idx;
@@ -49,12 +55,16 @@ struct Workspace {
     // Ring-buffer capacity used by reusable token/data buffers
     uint32_t num_ring_tokens;
     uint32_t num_ring_blocks;
+    uint32_t num_shared_l2_pool_blocks;
 
     // Full-pool span used by non-ring token metadata
     uint32_t num_max_pool_tokens;
 
-    // For both grid barrier and NVLink barrier
-    static constexpr uint64_t kNumBarrierSignalBytes = 32;
+    // Keep grid/NVLink/schedule counters separated from expert counters.
+    // NVIDIA L2 cache lines are 128B, and these counters are hot atomics.
+    static constexpr uint64_t kNumBarrierSignalBytes = 128;
+
+    Workspace() = default;
 
     // Only the remotely accumulated recv sums are double-buffered. Per-rank
     // recv counts are fully overwritten every launch (including zero-count
@@ -79,6 +89,7 @@ struct Workspace {
         num_max_recv_tokens_per_expert = num_ranks * num_max_tokens_per_rank;
         num_max_pool_tokens = get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
         num_ring_blocks = num_ring_tokens / kMinCandidateBlockM;
+        num_shared_l2_pool_blocks = math::ceil_div<uint32_t>(num_max_tokens_per_rank, kMinCandidateBlockM);
         banked_metadata_base = math::advance_ptr(
             base, kNumBarrierSignalBytes + get_shared_metadata_num_bytes() +
                   metadata_bank_idx * get_metadata_bank_num_bytes());
@@ -105,6 +116,9 @@ struct Workspace {
 
         // L2 empty block count (ring)
         num_bytes += num_ring_blocks * sizeof(uint32_t);
+
+        // Shared L2 full block count
+        num_bytes += num_shared_l2_pool_blocks * sizeof(uint32_t);
 
         return math::align<uint64_t>(num_bytes, 16);
     }
@@ -160,6 +174,11 @@ struct Workspace {
     // [ 0..15]: 4 x `uint32_t` grid sync counters
     // [16..20]: `uint32_t` NVLink barrier counter
     // [20..27]: 2 x `int` NVLink barrier signals (phase 0 and 1)
+    // [28..31]: `uint32_t` L1 schedule task counter
+    // [32..35]: `uint32_t` L2 schedule task counter
+    // [36..39]: `uint32_t` shared L1 schedule task counter
+    // [40..43]: `uint32_t` shared L2 schedule task counter
+    // [44..127]: padding to isolate hot expert counters from barrier/schedule counters
     static constexpr uint32_t kNumMaxGridSyncCounters = 4;
 
     template <uint32_t kIndex = 0>
@@ -178,6 +197,26 @@ struct Workspace {
     int* get_nvl_barrier_signal_ptr(const uint32_t& phase) const {
         // NOTES: the signal is signed, as we may minus
         return math::advance_ptr<int>(base, (kNumMaxGridSyncCounters + 1) * sizeof(uint32_t) + phase * sizeof(int));
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_l1_task_count_ptr() const {
+        return math::advance_ptr<uint32_t>(base, 28u);
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_l2_task_count_ptr() const {
+        return math::advance_ptr<uint32_t>(base, 32u);
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_shared_l1_task_count_ptr() const {
+        return math::advance_ptr<uint32_t>(base, 36u);
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_shared_l2_task_count_ptr() const {
+        return math::advance_ptr<uint32_t>(base, 40u);
     }
 
     CUTLASS_DEVICE
@@ -221,6 +260,12 @@ struct Workspace {
         return reinterpret_cast<uint32_t*>(base) + ring_block_idx;
     }
 
+    CUTLASS_DEVICE
+    uint32_t* get_shared_l2_full_count_ptr(const uint32_t& block_idx = 0) const {
+        const auto base = get_l2_empty_count_ptr(num_ring_blocks);
+        return reinterpret_cast<uint32_t*>(base) + block_idx;
+    }
+
     // For dispatch pulling
     CUTLASS_DEVICE
     uint32_t* get_src_token_topk_idx_ptr(
@@ -245,6 +290,8 @@ struct Data {
     uint32_t num_bytes;
     bool require_tma_alignment;
     void* base;
+
+    Data() = default;
 
     CUTLASS_HOST_DEVICE
     constexpr explicit Data(
@@ -276,6 +323,8 @@ struct Buffer {
     uint32_t num_max_tokens_per_rank;
 
     void* base;
+
+    Buffer() = default;
 
     CUTLASS_HOST_DEVICE
     Buffer(const Data& data_layout,
@@ -323,6 +372,126 @@ struct Buffer {
             data_layout.require_tma_alignment,
             math::advance_ptr(base, data_layout.get_num_bytes<uint64_t>() * token_idx)
         );
+    }
+};
+
+struct MegaMoEBuffer {
+    Workspace workspace;
+
+    // Input buffers (per-rank)
+    Buffer input_token_buffer,
+           input_sf_buffer,
+           input_topk_idx_buffer,
+           input_topk_weights_buffer;
+
+    // Routed expert ring buffers
+    // NOTE: shared L1 tokens reuse `input_token_buffer`.
+    Buffer shared_l1_token_buffer, shared_l1_sf_buffer,
+           shared_l2_token_buffer, shared_l2_sf_buffer;
+
+    // Routed expert ring buffers
+    Buffer l1_token_buffer,
+           l1_sf_buffer,
+           l1_topk_weights_buffer,
+           l2_token_buffer,
+           l2_sf_buffer,
+           combine_token_buffer;
+
+    CUTLASS_HOST_DEVICE
+    MegaMoEBuffer(void* base,
+                  const uint32_t& hidden,
+                  const uint32_t& intermediate_hidden,
+                  const uint32_t& num_ranks,
+                  const uint32_t& num_experts,
+                  const uint32_t& num_max_tokens_per_rank,
+                  const uint32_t& num_topk,
+                  const uint32_t& num_ring_tokens,
+                  const uint32_t& num_sf_ring_tokens,
+                  const bool& with_sf,
+                  const bool& use_nvfp4 = false,
+                  const uint32_t& num_shared_experts = 0) {
+        // Workspace
+        workspace = Workspace(base, num_ranks, num_experts,
+                              num_max_tokens_per_rank, num_topk, num_ring_tokens);
+
+        // Shared
+        const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
+        const auto num_max_shared_sf_tokens = with_sf ? get_num_max_shared_sf_tokens(num_max_tokens_per_rank) : 0u;
+
+        // Layouts
+        const auto input_token_layout = layout::Data(
+            with_sf ? hidden / (use_nvfp4 ? 2 : 1) : hidden * 2);
+        const auto bf16_token_layout = layout::Data(hidden * 2);
+        const auto intermediate_token_layout = layout::Data(
+            with_sf ? intermediate_hidden / (use_nvfp4 ? 2 : 1) : intermediate_hidden * 2);
+        const auto shared_intermediate_token_layout = layout::Data(
+            with_sf ? shared_intermediate_hidden / (use_nvfp4 ? 2 : 1) : shared_intermediate_hidden * 2);
+        const auto input_sf_layout = layout::Data(
+            with_sf ? hidden / (use_nvfp4 ? 16 : 32) : 0);
+        const auto intermediate_sf_layout = layout::Data(
+            with_sf ? intermediate_hidden / (use_nvfp4 ? 16 : 32) : 0);
+        const auto shared_intermediate_sf_layout = layout::Data(
+            with_sf ? shared_intermediate_hidden / (use_nvfp4 ? 16 : 32) : 0);
+        const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
+        const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
+        const auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
+
+        // Input buffers
+        input_token_buffer = Buffer(
+            input_token_layout, 1, num_max_tokens_per_rank,
+            workspace.get_end_ptr());
+        input_sf_buffer = Buffer(
+            input_sf_layout, 1, num_max_tokens_per_rank,
+            input_token_buffer.get_end_ptr());
+        input_topk_idx_buffer = Buffer(
+            input_topk_idx_layout, 1, num_max_tokens_per_rank,
+            with_sf ? input_sf_buffer.get_end_ptr() : input_token_buffer.get_end_ptr());
+        input_topk_weights_buffer = Buffer(
+            input_topk_weights_layout, 1, num_max_tokens_per_rank,
+            input_topk_idx_buffer.get_end_ptr());
+
+        // Shared expert buffers
+        shared_l1_token_buffer = input_token_buffer;
+        shared_l1_sf_buffer = Buffer(
+            input_sf_layout, 1, num_shared_experts > 0 ? num_max_shared_sf_tokens : 0,
+            input_topk_weights_buffer.get_end_ptr());
+        shared_l2_token_buffer = Buffer(
+            shared_intermediate_token_layout, 1, num_shared_experts > 0 ? num_max_tokens_per_rank : 0,
+            with_sf ? shared_l1_sf_buffer.get_end_ptr() : input_topk_weights_buffer.get_end_ptr());
+        shared_l2_sf_buffer = Buffer(
+            shared_intermediate_sf_layout, 1, num_shared_experts > 0 ? num_max_shared_sf_tokens : 0,
+            shared_l2_token_buffer.get_end_ptr());
+
+        // Routed expert ring buffers
+        l1_token_buffer = Buffer(
+            input_token_layout, 1, num_ring_tokens,
+            num_shared_experts > 0 ?
+                (with_sf ? shared_l2_sf_buffer.get_end_ptr() : shared_l2_token_buffer.get_end_ptr()) :
+                input_topk_weights_buffer.get_end_ptr()
+        );
+        l1_sf_buffer = Buffer(
+            input_sf_layout, 1, num_sf_ring_tokens,
+            l1_token_buffer.get_end_ptr());
+        l1_topk_weights_buffer = Buffer(
+            l1_topk_weights_layout, 1, num_ring_tokens,
+            with_sf ? l1_sf_buffer.get_end_ptr() : l1_token_buffer.get_end_ptr());
+
+        l2_token_buffer = Buffer(
+            intermediate_token_layout, 1, num_ring_tokens,
+            l1_topk_weights_buffer.get_end_ptr());
+        l2_sf_buffer = Buffer(
+            intermediate_sf_layout, 1, num_sf_ring_tokens,
+            l2_token_buffer.get_end_ptr());
+
+        combine_token_buffer = Buffer(
+            bf16_token_layout, num_topk + (num_shared_experts > 0 ? 1u : 0u), num_max_tokens_per_rank,
+            with_sf ? l2_sf_buffer.get_end_ptr() : l2_token_buffer.get_end_ptr());
+    }
+
+    CUTLASS_HOST_DEVICE
+    int64_t get_num_bytes() const {
+        return static_cast<uint8_t*>(combine_token_buffer.get_end_ptr())
+               - static_cast<uint8_t*>(workspace.base);
     }
 };
 

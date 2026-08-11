@@ -75,6 +75,12 @@ static int get_num_mma_elem_bytes(const MmaKind& mma_kind) {
     return mma_kind == MmaKind::BF16 ? 2 : 1;
 }
 
+static int get_num_mma_smem_bytes(const int& num_elements, const MmaKind& mma_kind) {
+    DG_HOST_ASSERT(mma_kind != MmaKind::NVFP4 or num_elements % 2 == 0);
+    return mma_kind == MmaKind::BF16 ? num_elements * 2 :
+           mma_kind == MmaKind::NVFP4 ? num_elements / 2 : num_elements;
+}
+
 static bool is_mma_with_sf(const MmaKind& mma_kind) {
     return mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::NVFP4;
 }
@@ -212,8 +218,6 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
-    const int num_mma_elem_bytes = get_num_mma_elem_bytes(mma_kind);
-
     // Always multicast on A
     const int load_block_m = block_m / 2;
 
@@ -238,26 +242,56 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_amax_reduction = is_mma_with_sf(mma_kind) ?
         store_block_m * num_epilogue_warps * static_cast<int>(sizeof(float)) : 0;
 
-    // Tensor memory pointer
-    const int smem_tmem_ptr = 4;
+    // Tensor-memory pointer plus epoch metadata bank/generation state.
+    const int smem_scalar_state = 3 * static_cast<int>(sizeof(uint32_t));
 
     // SF is aligned to UTCCP 128-element granularity
     const int smem_sfa_per_stage = is_mma_with_sf(mma_kind) ? sf_block_m * (block_k / gran_k) : 0;
     const int smem_sfb_per_stage = is_mma_with_sf(mma_kind) ? sf_block_n * (block_k / gran_k) : 0;
 
-    // Per-stage: A tile + B tile + optional SF tiles + full/empty barriers
-    const int smem_a_size_per_stage = load_block_m * block_k * num_mma_elem_bytes;
-    const int smem_b_size_per_stage = block_n * block_k * num_mma_elem_bytes;
-    const int smem_size_per_stage = smem_a_size_per_stage + smem_b_size_per_stage + smem_sfa_per_stage + smem_sfb_per_stage + 2 * 8;
+    // Per-stage: A tile + B tile + optional SF tiles + full/empty barriers.
+    // NVFP4 A/B remain packed in shared memory: two E2M1 values per byte.
+    // Output staging is intentionally still byte-addressable and continues to
+    // use `get_num_mma_elem_bytes` above.
+    const int smem_a_size_per_stage = get_num_mma_smem_bytes(load_block_m * block_k, mma_kind);
+    const int smem_b_size_per_stage = get_num_mma_smem_bytes(block_n * block_k, mma_kind);
+    DG_HOST_ASSERT(smem_a_size_per_stage % kSmemAlignment == 0);
+    DG_HOST_ASSERT(smem_b_size_per_stage % kSmemAlignment == 0);
+    const int smem_stage_barriers = 2 * 8;
+    const int smem_size_per_stage = smem_a_size_per_stage + smem_b_size_per_stage + smem_sfa_per_stage + smem_sfb_per_stage + smem_stage_barriers;
 
     // Fixed total
-    const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_barriers + smem_tmem_ptr;
+    const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_barriers + smem_scalar_state;
 
-    // Select maximum number of stages
-    const int num_stages = (smem_capacity - smem_fixed) / smem_size_per_stage;
+    // Select a tuned stage count within the physical shared-memory capacity.
+    const int max_num_stages = (smem_capacity - smem_fixed) / smem_size_per_stage;
+    int num_stages = max_num_stages;
+    if (mma_kind == MmaKind::NVFP4) {
+        // EP8 stage sweeps favor nine stages for Block-M16/M32 and six for
+        // Block-M64. Larger tiles remain on the conservative unpacked-byte
+        // estimate until they have an equivalent promotion result.
+        if (block_m <= 32) {
+            num_stages = std::min(max_num_stages, 9);
+        } else if (block_m == 64) {
+            num_stages = std::min(max_num_stages, 6);
+        } else {
+            const int conservative_size_per_stage =
+                load_block_m * block_k + block_n * block_k +
+                smem_sfa_per_stage + smem_sfb_per_stage + smem_stage_barriers;
+            num_stages = (smem_capacity - smem_fixed) / conservative_size_per_stage;
+        }
+
+        const int num_stages_override = get_env<int>("DG_NVFP4_MEGAMOE_NUM_STAGES", 0);
+        DG_HOST_ASSERT(num_stages_override == 0 or
+                       (num_stages_override >= 2 and num_stages_override <= max_num_stages));
+        if (num_stages_override != 0)
+            num_stages = num_stages_override;
+    }
     DG_HOST_ASSERT(num_stages >= 2);
 
-    return {num_stages, smem_fixed + num_stages * smem_size_per_stage};
+    const int smem_size = smem_fixed + num_stages * smem_size_per_stage;
+    DG_HOST_ASSERT(smem_size <= smem_capacity);
+    return {num_stages, smem_size};
 }
 
 static MegaMoEConfig get_mega_moe_config(
@@ -278,7 +312,8 @@ static MegaMoEConfig get_mega_moe_config(
     const int load_block_n = block_n;
     const auto [sf_block_m, sf_block_n] = is_mma_with_sf(mma_kind) ?
         SM100ArchSpec::get_sf_uttcp_aligned_block_sizes(block_m, block_n, mma_kind) : std::pair(0, 0);
-    // NOTES: FP8 activations and FP4 weights (unpacked to 8-bit in smem) both use 128B swizzle
+    // MXFP8 uses byte-addressable unpack-SMEM descriptors. NVFP4 keeps both
+    // operands packed and uses a 256-element SW128 atom.
     const int swizzle_acts_mode = 128;
     const int swizzle_weights_mode = 128;
     const int gran_k = mma_kind == MmaKind::NVFP4 ? 16 : 32;
@@ -327,8 +362,9 @@ static MegaMoEConfig get_mega_moe_config(
     // Print configs for the first time
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         const auto key = fmt::format(
-            "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
-            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk);
+            "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={}, mma_kind={})",
+            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk,
+            static_cast<int>(mma_kind));
         static std::unordered_set<std::string> printed;
         if (printed.count(key) == 0) {
             std::cout << key << ": " << config << std::endl;

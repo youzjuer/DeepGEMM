@@ -147,6 +147,13 @@ def per_token_cast_to_nvfp4(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor
     return packed.contiguous(), packed_sf.contiguous()
 
 
+def per_token_cast_to_mxfp4(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize rows to MXFP4 with group-32 UE8M0 scale factors."""
+    assert x.dim() == 2 and x.size(1) % 128 == 0
+    return per_token_cast_to_fp4(
+        x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+
+
 def transpose_packed_fp4(a: torch.Tensor) -> torch.Tensor:
     assert a.dtype == torch.int8
     assert a.dim() == 2
@@ -196,6 +203,11 @@ def cast_back_from_fp4(packed: torch.Tensor, sf: torch.Tensor, gran_k: int = 128
 
 def cast_back_from_nvfp4(packed: torch.Tensor, packed_sf: torch.Tensor) -> torch.Tensor:
     return cast_back_from_fp4(packed, unpack_e4m3_from_int(packed_sf), gran_k=16)
+
+
+def cast_back_from_mxfp4(packed: torch.Tensor, packed_sf: torch.Tensor) -> torch.Tensor:
+    return cast_back_from_fp4(
+        packed, packed_sf, gran_k=32, use_packed_ue8m0=True)
 
 
 def cast_back_from_fp8(x_fp8: torch.Tensor, sf: torch.Tensor, gran_k: int = 128,

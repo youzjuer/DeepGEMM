@@ -9,9 +9,11 @@ from typing import Optional, Tuple
 import deep_gemm
 from deep_gemm.utils import (
     align,
+    cast_back_from_mxfp4,
     cast_back_from_nvfp4,
     per_token_cast_to_fp4,
     per_token_cast_to_fp8,
+    per_token_cast_to_mxfp4,
     per_token_cast_to_nvfp4,
 )
 from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
@@ -39,17 +41,19 @@ def import_baseline():
     return deep_ep, tilelang_ops, do_bench, is_legacy_loaded
 
 
-def run_nvfp4_reference(x, topk_idx, topk_weights, l1_weights, l2_weights,
-                         rank_idx, num_experts_per_rank, group,
-                         activation_clamp):
-    """Slow, independent NVFP4 MegaMoE oracle for correctness tests.
+def run_packed_fp4_reference(x, topk_idx, topk_weights, l1_weights, l2_weights,
+                             rank_idx, num_experts_per_rank, group,
+                             activation_clamp, use_mxfp4):
+    """Slow, independent packed-FP4 MegaMoE oracle for correctness tests.
 
     Each rank evaluates the routes owned by its local experts. The partial
     outputs are then summed across ranks, mirroring the fused kernel's combine
-    stage. Both GEMMs consume dequantized group-16 NVFP4 operands, and the
-    SwiGLU output is requantized to NVFP4 before L2.
+    stage. Both GEMMs consume dequantized packed E2M1 operands, and the SwiGLU
+    output is requantized with the selected scale contract before L2.
     """
-    x_dequantized = cast_back_from_nvfp4(*x).to(torch.bfloat16)
+    dequantize = cast_back_from_mxfp4 if use_mxfp4 else cast_back_from_nvfp4
+    quantize = per_token_cast_to_mxfp4 if use_mxfp4 else per_token_cast_to_nvfp4
+    x_dequantized = dequantize(*x).to(torch.bfloat16)
     gathered_x = uneven_all_gather(x_dequantized, group=group)
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
     gathered_topk_weights = uneven_all_gather(topk_weights, group=group)
@@ -72,7 +76,7 @@ def run_nvfp4_reference(x, topk_idx, topk_weights, l1_weights, l2_weights,
         token_indices, topk_slots = routes[:, 0], routes[:, 1]
         route_weights = gathered_topk_weights[token_indices, topk_slots].float().unsqueeze(1)
 
-        l1_weight = cast_back_from_nvfp4(
+        l1_weight = dequantize(
             l1_weights[0][local_expert_idx], l1_weights[1][local_expert_idx]).to(torch.bfloat16)
         l1_output = torch.matmul(gathered_x[token_indices], l1_weight.t()).to(torch.bfloat16)
         gate, up = l1_output.chunk(2, dim=1)
@@ -82,10 +86,9 @@ def run_nvfp4_reference(x, topk_idx, topk_weights, l1_weights, l2_weights,
 
         gate = gate.float()
         intermediate = gate / (1.0 + torch.exp(-gate)) * up.float() * route_weights
-        intermediate = cast_back_from_nvfp4(
-            *per_token_cast_to_nvfp4(intermediate)).to(torch.bfloat16)
+        intermediate = dequantize(*quantize(intermediate)).to(torch.bfloat16)
 
-        l2_weight = cast_back_from_nvfp4(
+        l2_weight = dequantize(
             l2_weights[0][local_expert_idx], l2_weights[1][local_expert_idx]).to(torch.bfloat16)
         route_output = torch.matmul(intermediate, l2_weight.t()).to(torch.bfloat16)
         reference.index_add_(0, token_indices, route_output.float())
@@ -159,12 +162,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # Settings
     is_bf16xbf16 = args.mma_type == 'bf16xbf16'
     is_nvfp4 = args.mma_type == 'nvfp4xnvfp4'
-    assert is_bf16xbf16 or is_nvfp4 or args.mma_type == 'fp8xfp4'
+    is_mxfp4 = args.mma_type == 'mxfp4xmxfp4'
+    is_packed_fp4 = is_nvfp4 or is_mxfp4
+    assert is_bf16xbf16 or is_packed_fp4 or args.mma_type == 'fp8xfp4'
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
     num_tokens = max(0, args.num_max_tokens_per_rank - random.randint(0, args.num_max_removed_tokens)) \
         if args.num_tokens == 0 else args.num_tokens
     num_shared_experts = args.num_shared_experts
-    assert not is_nvfp4 or num_shared_experts == 0, 'NVFP4 MegaMoE does not yet support shared experts'
+    assert not is_packed_fp4 or num_shared_experts == 0, 'Packed-FP4 MegaMoE does not yet support shared experts'
     num_experts, num_topk = args.num_experts, args.num_topk
     num_experts_per_rank = num_experts // num_ranks
     hidden, intermediate_hidden = args.hidden, args.intermediate_hidden
@@ -184,10 +189,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     def _cast_weights_to_fp4(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         num_groups, n, k = bf16_weights.shape
         w = torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.int8)
-        if is_nvfp4:
-            w_sf = torch.empty((num_groups, n, k // 64), device='cuda', dtype=torch.int32)
+        if is_packed_fp4:
+            w_sf = torch.empty(
+                (num_groups, n, k // (128 if is_mxfp4 else 64)),
+                device='cuda', dtype=torch.int32)
+            quantize = per_token_cast_to_mxfp4 if is_mxfp4 else per_token_cast_to_nvfp4
             for i in range(num_groups):
-                w[i], w_sf[i] = per_token_cast_to_nvfp4(bf16_weights[i])
+                w[i], w_sf[i] = quantize(bf16_weights[i])
         else:
             w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
             for i in range(num_groups):
@@ -230,8 +238,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
         if not is_bf16xbf16:
             assert hidden % 128 == 0 and intermediate_hidden % 128 == 0 and shared_intermediate_hidden % 128 == 0
-            if is_nvfp4:
-                x = per_token_cast_to_nvfp4(x)
+            if is_packed_fp4:
+                x = (per_token_cast_to_mxfp4 if is_mxfp4 else per_token_cast_to_nvfp4)(x)
             else:
                 # FP8 path: cast inputs to FP8/FP4 with per-32 UE8M0 SF
                 block_m = deep_gemm.get_block_m_for_mega_moe(
@@ -281,7 +289,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math))
         kernel_fn = deep_gemm.bf16_mega_moe if is_bf16xbf16 else \
-            (deep_gemm.nvfp4_mega_moe if is_nvfp4 else deep_gemm.fp8_fp4_mega_moe)
+            (deep_gemm.mxfp4_mega_moe if is_mxfp4 else
+             deep_gemm.nvfp4_mega_moe if is_nvfp4 else deep_gemm.fp8_fp4_mega_moe)
         if num_shared_experts > 0:
             kernel_kwargs.update(
                 shared_l1_weights=transformed_shared_l1_weights,
@@ -316,7 +325,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # Non-overlapped baseline: EP dispatch + GEMM + EP combine
     deep_ep, tilelang_ops, tilelang_bench, is_legacy_loaded = import_baseline()
     # The legacy oracle has no NVFP4 dispatch/GEMM path.
-    if is_nvfp4:
+    if is_packed_fp4:
         is_legacy_loaded = False
     alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
     deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
@@ -423,18 +432,18 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
                 dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed', once_in_node=True)
         dist_print(once_in_node=True)
-    elif is_nvfp4 and num_correctness_tests > 0:
+    elif is_packed_fp4 and num_correctness_tests > 0:
         max_rel_l2 = getattr(args, 'nvfp4_max_rel_l2', 0.05)
         min_cosine = getattr(args, 'nvfp4_min_cosine', 0.999)
         dist_print(
-            f'Running NVFP4 reference tests (rel-L2 <= {max_rel_l2}, cosine >= {min_cosine}):',
+            f'Running packed-FP4 reference tests (rel-L2 <= {max_rel_l2}, cosine >= {min_cosine}):',
             once_in_node=True)
         for i in range(num_correctness_tests):
             create_inputs()
             y_fused, _ = run_fused()
-            y_reference = run_nvfp4_reference(
+            y_reference = run_packed_fp4_reference(
                 x, topk_idx, topk_weights, l1_weights, l2_weights,
-                rank_idx, num_experts_per_rank, group, args.activation_clamp)
+                rank_idx, num_experts_per_rank, group, args.activation_clamp, is_mxfp4)
             rel_l2, cosine = check_nvfp4_reference(
                 y_fused, y_reference, max_rel_l2=max_rel_l2, min_cosine=min_cosine)
             dist_print(
@@ -444,7 +453,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         dist_print(once_in_node=True)
     else:
         create_inputs()
-        if is_nvfp4:
+        if is_packed_fp4:
             y_smoke, _ = run_fused()
             assert torch.isfinite(y_smoke).all()
 
@@ -471,7 +480,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # HBM bytes: weights + activations + output
     num_touched_experts = torch.unique(gathered_topk_idx[gathered_topk_idx >= 0]).numel()
     act_elem_size, weight_elem_size = (2, 2) if is_bf16xbf16 else \
-        ((0.5, 0.5) if is_nvfp4 else (1, 0.5))
+        ((0.5, 0.5) if is_packed_fp4 else (1, 0.5))
     num_routed_hbm_bytes = (
         num_touched_experts * intermediate_hidden * 2 * hidden * weight_elem_size      # L1 weights
         + num_touched_experts * hidden * intermediate_hidden * weight_elem_size        # L2 weights
@@ -491,7 +500,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_hbm_bytes = num_routed_hbm_bytes + num_shared_hbm_bytes
 
     # NVLink bytes: dispatch pull + combine write-back
-    num_nvlink_bytes = num_recv_tokens * hidden * (2.5 if is_nvfp4 else 3)
+    num_nvlink_bytes = num_recv_tokens * hidden * (2.5 if is_packed_fp4 else 3)
 
     # Combine reduction (serial) time approximation
     t_reduction = num_tokens * hidden * 2 * (1 + num_topk) / 6.5e12
@@ -543,7 +552,7 @@ if __name__ == '__main__':
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
     parser.add_argument('--mma-type', type=str, default='fp8xfp4',
-                        help='MMA type: fp8xfp4, nvfp4xnvfp4, or bf16xbf16')
+                        help='MMA type: fp8xfp4, nvfp4xnvfp4, mxfp4xmxfp4, or bf16xbf16')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')

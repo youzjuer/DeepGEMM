@@ -26,7 +26,7 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
-        bool use_nvfp4;
+        int fp4_scale_granularity;
         bool use_epoch_workspace;
         bool use_expert_routing_map;
         int dispatch_ready_mode;
@@ -113,7 +113,7 @@ static void __instantiate_kernel() {{
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
-    args.use_nvfp4 ? "true" : "false",
+    args.fp4_scale_granularity,
     args.use_epoch_workspace ? "true" : "false",
     args.use_expert_routing_map ? "true" : "false",
     args.dispatch_ready_mode,
@@ -173,7 +173,7 @@ static void sm100_fp8_fp4_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
     const bool& fast_math,
-    const bool& use_nvfp4,
+    const MmaKind& mma_kind,
     const int* expert_routing_choices,
     const int* expert_routing_counts,
     const int& num_logical_experts,
@@ -185,22 +185,24 @@ static void sm100_fp8_fp4_mega_moe(
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
     const auto num_sf_ring_tokens = static_cast<int>(l1_acts_sf.size(0));
     const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
+    const bool use_packed_fp4 = is_packed_fp4_mma(mma_kind);
+    const int fp4_scale_granularity = use_packed_fp4 ? get_mma_sf_gran_k(mma_kind) : 0;
 
     // Heuristics
     const auto config = get_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
-        use_nvfp4 ? MmaKind::NVFP4 : MmaKind::MXFP8FP4);
+        mma_kind);
 
     // Make tensormap
-    const int kGranK = use_nvfp4 ? 16 : 32;
+    const int kGranK = get_mma_sf_gran_k(mma_kind);
     const int sf_smem_outer_dim = config.block_k / (kGranK * 4);
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
                                                      hidden, config.num_ring_tokens,
                                                      config.block_k, config.load_block_m,
                                                      static_cast<int>(l1_acts.stride(-2)),
-                                                     config.swizzle_acts_mode, 0, false, not use_nvfp4);
+                                                     config.swizzle_acts_mode, 0, false, not use_packed_fp4);
     const auto tensor_map_l1_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
                                                         config.num_sf_ring_tokens, hidden,
                                                         config.sf_block_m, kGranK,
@@ -210,7 +212,7 @@ static void sm100_fp8_fp4_mega_moe(
                                                         hidden, num_experts_per_rank * intermediate_hidden * 2,
                                                         config.block_k, config.load_block_n,
                                                         static_cast<int>(l1_weights.stride(-2)),
-                                                        config.swizzle_weights_mode, 0, false, not use_nvfp4);
+                                                        config.swizzle_weights_mode, 0, false, not use_packed_fp4);
     const auto tensor_map_l1_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
                                                            intermediate_hidden * 2, hidden,
                                                            config.block_n, kGranK,
@@ -223,7 +225,7 @@ static void sm100_fp8_fp4_mega_moe(
     // inner box, while post-SwiGLU produces only BLOCK_N/2 = 64 elements.
     // The NVFP4 epilogue therefore packs and stores directly; keep a valid
     // load-style descriptor as an unused launch-ABI placeholder.
-    const auto tensor_map_l1_output = use_nvfp4 ?
+    const auto tensor_map_l1_output = use_packed_fp4 ?
         make_tma_2d_desc(l2_acts,
                          intermediate_hidden, config.num_ring_tokens,
                          config.block_k, config.load_block_m,
@@ -238,7 +240,7 @@ static void sm100_fp8_fp4_mega_moe(
                                                      intermediate_hidden, config.num_ring_tokens,
                                                      config.block_k, config.load_block_m,
                                                      static_cast<int>(l2_acts.stride(-2)),
-                                                     config.swizzle_acts_mode, 0, false, not use_nvfp4);
+                                                     config.swizzle_acts_mode, 0, false, not use_packed_fp4);
     const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
                                                         config.num_sf_ring_tokens, intermediate_hidden,
                                                         config.sf_block_m, kGranK,
@@ -248,7 +250,7 @@ static void sm100_fp8_fp4_mega_moe(
                                                         intermediate_hidden, num_experts_per_rank * hidden,
                                                         config.block_k, config.load_block_n,
                                                         static_cast<int>(l2_weights.stride(-2)),
-                                                        config.swizzle_weights_mode, 0, false, not use_nvfp4);
+                                                        config.swizzle_weights_mode, 0, false, not use_packed_fp4);
     const auto tensor_map_l2_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
                                                            hidden, intermediate_hidden,
                                                            config.block_n, kGranK,
@@ -317,10 +319,10 @@ static void sm100_fp8_fp4_mega_moe(
 
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
-    const bool use_epoch_workspace = use_nvfp4 and
+    const bool use_epoch_workspace = use_packed_fp4 and
         get_env<int>("DG_NVFP4_MEGAMOE_EPOCH_WORKSPACE", 0) != 0;
     const bool use_expert_routing_map = expert_routing_choices != nullptr;
-    const int dispatch_ready_mode = use_nvfp4 ?
+    const int dispatch_ready_mode = use_packed_fp4 ?
         get_env<int>("DG_NVFP4_MEGAMOE_DISPATCH_READY_MODE", 0) : 0;
     DG_HOST_ASSERT(0 <= dispatch_ready_mode and dispatch_ready_mode <= 4);
     DG_HOST_ASSERT(dispatch_ready_mode == 0 or use_epoch_workspace);
@@ -333,7 +335,7 @@ static void sm100_fp8_fp4_mega_moe(
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
-        .use_nvfp4 = use_nvfp4,
+        .fp4_scale_granularity = fp4_scale_granularity,
         .use_epoch_workspace = use_epoch_workspace,
         .use_expert_routing_map = use_expert_routing_map,
         .dispatch_ready_mode = dispatch_ready_mode,
@@ -373,7 +375,8 @@ static void sm100_fp8_fp4_mega_moe(
 
     const auto code = SM100FP8FP4MegaMoERuntime::generate(args);
     const auto runtime = compiler->build(
-        use_nvfp4 ? "sm100_nvfp4_mega_moe" : "sm100_fp8_fp4_mega_moe", code);
+        mma_kind == MmaKind::NVFP4 ? "sm100_nvfp4_mega_moe" :
+        mma_kind == MmaKind::MXFP4 ? "sm100_mxfp4_mega_moe" : "sm100_fp8_fp4_mega_moe", code);
     SM100FP8FP4MegaMoERuntime::launch(runtime, args);
 }
 

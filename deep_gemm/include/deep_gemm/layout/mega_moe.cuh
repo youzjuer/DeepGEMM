@@ -408,7 +408,8 @@ struct MegaMoEBuffer {
                   const uint32_t& num_ring_tokens,
                   const uint32_t& num_sf_ring_tokens,
                   const bool& with_sf,
-                  const bool& use_nvfp4 = false,
+                  const bool& use_packed_fp4 = false,
+                  const uint32_t& sf_gran_k = 32,
                   const uint32_t& num_shared_experts = 0) {
         // Workspace
         workspace = Workspace(base, num_ranks, num_experts,
@@ -420,18 +421,18 @@ struct MegaMoEBuffer {
 
         // Layouts
         const auto input_token_layout = layout::Data(
-            with_sf ? hidden / (use_nvfp4 ? 2 : 1) : hidden * 2);
+            with_sf ? hidden / (use_packed_fp4 ? 2 : 1) : hidden * 2);
         const auto bf16_token_layout = layout::Data(hidden * 2);
         const auto intermediate_token_layout = layout::Data(
-            with_sf ? intermediate_hidden / (use_nvfp4 ? 2 : 1) : intermediate_hidden * 2);
+            with_sf ? intermediate_hidden / (use_packed_fp4 ? 2 : 1) : intermediate_hidden * 2);
         const auto shared_intermediate_token_layout = layout::Data(
-            with_sf ? shared_intermediate_hidden / (use_nvfp4 ? 2 : 1) : shared_intermediate_hidden * 2);
+            with_sf ? shared_intermediate_hidden / (use_packed_fp4 ? 2 : 1) : shared_intermediate_hidden * 2);
         const auto input_sf_layout = layout::Data(
-            with_sf ? hidden / (use_nvfp4 ? 16 : 32) : 0);
+            with_sf ? hidden / sf_gran_k : 0);
         const auto intermediate_sf_layout = layout::Data(
-            with_sf ? intermediate_hidden / (use_nvfp4 ? 16 : 32) : 0);
+            with_sf ? intermediate_hidden / sf_gran_k : 0);
         const auto shared_intermediate_sf_layout = layout::Data(
-            with_sf ? shared_intermediate_hidden / (use_nvfp4 ? 16 : 32) : 0);
+            with_sf ? shared_intermediate_hidden / sf_gran_k : 0);
         const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
         const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
         const auto l1_topk_weights_layout = layout::Data(sizeof(float), false);

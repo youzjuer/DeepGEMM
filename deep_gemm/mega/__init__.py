@@ -286,6 +286,37 @@ def nvfp4_mega_moe(y: torch.Tensor,
         kernel_profile
     )
 
+
+def mxfp4_mega_moe(y: torch.Tensor,
+                    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                    sym_buffer: SymmBuffer,
+                    shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                    shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                    cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                    recipe: Tuple[int, int, int] = (1, 1, 32),
+                    activation: str = 'swiglu',
+                    activation_clamp: Optional[float] = None,
+                    fast_math: bool = True,
+                    expert_routing_map: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                    kernel_profile: Optional[torch.Tensor] = None):
+    """Run fused E2M1xE2M1 MegaMoE with group-32 UE8M0 scaling."""
+    _C.mxfp4_mega_moe(
+        y,
+        l1_weights, l2_weights,
+        shared_l1_weights, shared_l2_weights,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe,
+        activation, activation_clamp,
+        fast_math,
+        expert_routing_map,
+        kernel_profile
+    )
+
 def bf16_mega_moe(y: torch.Tensor,
                   l1_weights: torch.Tensor,
                   l2_weights: torch.Tensor,

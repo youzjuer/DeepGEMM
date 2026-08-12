@@ -103,7 +103,8 @@ sm100_bf16_mega_moe_impl(void* y,
         kNumMaxTokensPerRank, kNumTopk,
         kNumRingTokens, 0,
         /*with_sf=*/ false,
-        /*use_nvfp4=*/ false,
+        /*use_packed_fp4=*/ false,
+        /*sf_gran_k=*/ 32,
         kNumSharedExperts
     );
     const auto workspace = buffer.workspace;

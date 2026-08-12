@@ -8,6 +8,7 @@ enum class MmaKind {
     BF16        = 0,
     MXFP8FP4    = 1,
     NVFP4       = 2,
+    MXFP4       = 3,
 };
 
 constexpr CUTLASS_HOST_DEVICE int get_element_size(const MmaKind& mma_kind) {
@@ -17,6 +18,7 @@ constexpr CUTLASS_HOST_DEVICE int get_element_size(const MmaKind& mma_kind) {
         // FP4 operands are packed in global memory but unpacked to one byte
         // per element in shared memory by TMA.
         case MmaKind::NVFP4:    return 1;
+        case MmaKind::MXFP4:    return 1;
         default: return 0;
     }
 }

@@ -98,6 +98,15 @@ CUTLASS_DEVICE void get_e4m3_sf_and_sf_inv(const float2& amax, float2& sf, float
     sf.y = fast_pow2(exp_y), sf_inv.y = fast_pow2(-exp_y);
 }
 
+CUTLASS_DEVICE void get_e2m1_sf_and_sf_inv(const float2& amax, float2& sf, float2& sf_inv) {
+    const float2 finfo_factor = {1.0f / 6.0f, 1.0f / 6.0f};
+    const auto scaled = __fmul2_rn(amax, finfo_factor);
+    const auto exp_x = fast_log2_ceil(scaled.x);
+    const auto exp_y = fast_log2_ceil(scaled.y);
+    sf.x = fast_pow2(exp_x), sf_inv.x = fast_pow2(-exp_x);
+    sf.y = fast_pow2(exp_y), sf_inv.y = fast_pow2(-exp_y);
+}
+
 /// Reduction
 CUTLASS_DEVICE uint32_t warp_inclusive_sum(uint32_t value, const uint32_t& lane_idx) {
     #pragma unroll

@@ -100,8 +100,9 @@ get_symm_buffer_size_for_mega_moe(
     // Parse MMA type
     const auto mma_kind = parse_mma_kind(mma_type);
     const auto with_sf = is_mma_with_sf(mma_kind);
-    const auto is_nvfp4 = mma_kind == MmaKind::NVFP4;
-    DG_HOST_ASSERT(not is_nvfp4 or num_shared_experts == 0);
+    const auto is_packed_fp4 = is_packed_fp4_mma(mma_kind);
+    const auto sf_gran_k = get_mma_sf_gran_k(mma_kind);
+    DG_HOST_ASSERT(not is_packed_fp4 or num_shared_experts == 0);
 
     // Compute num_sf_ring_tokens (max across all candidate block sizes)
     int num_sf_ring_tokens = 0;
@@ -118,7 +119,7 @@ get_symm_buffer_size_for_mega_moe(
         nullptr, hidden, intermediate_hidden,
         num_ranks, num_experts, num_max_tokens_per_rank,
         num_topk, num_ring_tokens, num_sf_ring_tokens, with_sf,
-        is_nvfp4,
+        is_packed_fp4, sf_gran_k,
         num_shared_experts
     );
 
@@ -134,11 +135,11 @@ get_symm_buffer_size_for_mega_moe(
     auto slice_input_buffers = [=](const torch::Tensor& buffer) {
         auto x = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.input_token_buffer.base)),
-            {num_max_tokens_per_rank, is_nvfp4 ? hidden / 2 : hidden},
-            torch::TensorOptions().dtype(is_nvfp4 ? kPackedFP4 : (with_sf ? torch::kFloat8_e4m3fn : torch::kBFloat16)).device(buffer.device()));
+            {num_max_tokens_per_rank, is_packed_fp4 ? hidden / 2 : hidden},
+            torch::TensorOptions().dtype(is_packed_fp4 ? kPackedFP4 : (with_sf ? torch::kFloat8_e4m3fn : torch::kBFloat16)).device(buffer.device()));
         auto x_sf = with_sf ? torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.input_sf_buffer.base)),
-            {num_max_tokens_per_rank, hidden / (is_nvfp4 ? 64 : 128)},
+            {num_max_tokens_per_rank, hidden / (sf_gran_k * 4)},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device())) : torch::Tensor();
         auto topk_idx = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.input_topk_idx_buffer.base)),
@@ -152,35 +153,35 @@ get_symm_buffer_size_for_mega_moe(
         auto shared_l1_acts = x;
         auto shared_l1_acts_sf = (with_sf and num_shared_experts > 0) ? torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.shared_l1_sf_buffer.base)),
-            {layout::get_num_max_shared_sf_tokens(num_max_tokens_per_rank), hidden / (is_nvfp4 ? 64 : 128)},
+            {layout::get_num_max_shared_sf_tokens(num_max_tokens_per_rank), hidden / (sf_gran_k * 4)},
             {1, layout::get_num_max_shared_sf_tokens(num_max_tokens_per_rank)},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device())) : torch::Tensor();
         auto shared_l2_acts = num_shared_experts > 0 ? torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.shared_l2_token_buffer.base)),
-            {num_max_tokens_per_rank, is_nvfp4 ? shared_intermediate_hidden / 2 : shared_intermediate_hidden},
-            torch::TensorOptions().dtype(is_nvfp4 ? kPackedFP4 : (with_sf ? torch::kFloat8_e4m3fn : torch::kBFloat16)).device(buffer.device())) : torch::Tensor();
+            {num_max_tokens_per_rank, is_packed_fp4 ? shared_intermediate_hidden / 2 : shared_intermediate_hidden},
+            torch::TensorOptions().dtype(is_packed_fp4 ? kPackedFP4 : (with_sf ? torch::kFloat8_e4m3fn : torch::kBFloat16)).device(buffer.device())) : torch::Tensor();
         auto shared_l2_acts_sf = (with_sf and num_shared_experts > 0) ? torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.shared_l2_sf_buffer.base)),
-            {layout::get_num_max_shared_sf_tokens(num_max_tokens_per_rank), shared_intermediate_hidden / (is_nvfp4 ? 64 : 128)},
+            {layout::get_num_max_shared_sf_tokens(num_max_tokens_per_rank), shared_intermediate_hidden / (sf_gran_k * 4)},
             {1, layout::get_num_max_shared_sf_tokens(num_max_tokens_per_rank)},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device())) : torch::Tensor();
 
         auto l1_acts = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.l1_token_buffer.base)),
-            {num_ring_tokens, is_nvfp4 ? hidden / 2 : hidden},
-            torch::TensorOptions().dtype(is_nvfp4 ? kPackedFP4 : (with_sf ? torch::kFloat8_e4m3fn : torch::kBFloat16)).device(buffer.device()));
+            {num_ring_tokens, is_packed_fp4 ? hidden / 2 : hidden},
+            torch::TensorOptions().dtype(is_packed_fp4 ? kPackedFP4 : (with_sf ? torch::kFloat8_e4m3fn : torch::kBFloat16)).device(buffer.device()));
         auto l1_acts_sf = with_sf ? torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.l1_sf_buffer.base)),
-            {num_sf_ring_tokens, hidden / (is_nvfp4 ? 64 : 128)},
+            {num_sf_ring_tokens, hidden / (sf_gran_k * 4)},
             {1, num_sf_ring_tokens},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device())) : torch::Tensor();
         auto l2_acts = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.l2_token_buffer.base)),
-            {num_ring_tokens, is_nvfp4 ? intermediate_hidden / 2 : intermediate_hidden},
-            torch::TensorOptions().dtype(is_nvfp4 ? kPackedFP4 : (with_sf ? torch::kFloat8_e4m3fn : torch::kBFloat16)).device(buffer.device()));
+            {num_ring_tokens, is_packed_fp4 ? intermediate_hidden / 2 : intermediate_hidden},
+            torch::TensorOptions().dtype(is_packed_fp4 ? kPackedFP4 : (with_sf ? torch::kFloat8_e4m3fn : torch::kBFloat16)).device(buffer.device()));
         auto l2_acts_sf = with_sf ? torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.l2_sf_buffer.base)),
-            {num_sf_ring_tokens, intermediate_hidden / (is_nvfp4 ? 64 : 128)},
+            {num_sf_ring_tokens, intermediate_hidden / (sf_gran_k * 4)},
             {1, num_sf_ring_tokens},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device())) : torch::Tensor();
         return std::make_tuple(x, x_sf, topk_idx, topk_weights,
@@ -205,20 +206,22 @@ static void low_precision_mega_moe(
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
-    const bool& use_nvfp4,
+    const MmaKind& mma_kind,
     const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& expert_routing_map,
     const std::optional<torch::Tensor>& kernel_profile
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
+    const bool use_packed_fp4 = is_packed_fp4_mma(mma_kind);
+    const int kGranK = get_mma_sf_gran_k(mma_kind);
 
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
     const auto [rm, rn, rk] = recipe;
-    DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == (use_nvfp4 ? 16 : 32));
+    DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == kGranK);
     DG_HOST_ASSERT(activation == "swiglu");
     DG_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == shared_l2_weights_tuple_opt.has_value());
-    DG_HOST_ASSERT(not use_nvfp4 or not shared_l1_weights_tuple_opt.has_value());
+    DG_HOST_ASSERT(not use_packed_fp4 or not shared_l1_weights_tuple_opt.has_value());
 
     // Activation checks
     const auto activation_clamp =
@@ -244,7 +247,6 @@ static void low_precision_mega_moe(
     // Check packed SF layout (UE8M0/group-32 or UE4M3/group-16),
     // MN-major ordering, and TMA alignment.
     constexpr int kGranMN = 1;
-    const int kGranK = use_nvfp4 ? 16 : 32;
     check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
                     num_experts_per_rank, true, false, torch::kInt);
     check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
@@ -286,7 +288,7 @@ static void low_precision_mega_moe(
     uint64_t* kernel_profile_ptr = nullptr;
     if (kernel_profile.has_value()) {
         using ProfileLayout = profile::MegaMoEKernelProfileLayout;
-        DG_HOST_ASSERT(use_nvfp4 and "Kernel profiling is supported only by NVFP4 MegaMoE");
+        DG_HOST_ASSERT(use_packed_fp4 and "Kernel profiling is supported only by packed-FP4 MegaMoE");
         DG_HOST_ASSERT(kernel_profile->scalar_type() == torch::kInt64);
         DG_HOST_ASSERT(kernel_profile->is_cuda());
         DG_HOST_ASSERT(kernel_profile->is_contiguous());
@@ -306,7 +308,7 @@ static void low_precision_mega_moe(
     int num_logical_experts = 0;
     int max_expert_instances = 0;
     if (expert_routing_map.has_value()) {
-        DG_HOST_ASSERT(use_nvfp4 and "Expert routing maps are supported only by NVFP4 MegaMoE");
+        DG_HOST_ASSERT(use_packed_fp4 and "Expert routing maps are supported only by packed-FP4 MegaMoE");
         const auto& [choices, counts] = expert_routing_map.value();
         DG_HOST_ASSERT(choices.scalar_type() == torch::kInt);
         DG_HOST_ASSERT(counts.scalar_type() == torch::kInt);
@@ -331,7 +333,9 @@ static void low_precision_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        use_nvfp4 ? "nvfp4xnvfp4" : "fp8xfp4", activation, num_shared_experts
+        mma_kind == MmaKind::NVFP4 ? "nvfp4xnvfp4" :
+        mma_kind == MmaKind::MXFP4 ? "mxfp4xmxfp4" : "fp8xfp4",
+        activation, num_shared_experts
     );
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
@@ -359,7 +363,7 @@ static void low_precision_mega_moe(
                                num_shared_experts,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, fast_math, use_nvfp4,
+                               activation_clamp, fast_math, mma_kind,
                                expert_routing_choices_ptr,
                                expert_routing_counts_ptr,
                                num_logical_experts,
@@ -398,7 +402,7 @@ static void fp8_fp4_mega_moe(
         sym_buffer, sym_buffer_ptrs, rank_idx,
         num_max_tokens_per_rank, num_experts, num_topk,
         recipe, activation, activation_clamp_opt, fast_math,
-        false, std::nullopt, std::nullopt);
+        MmaKind::MXFP8FP4, std::nullopt, std::nullopt);
 }
 
 static void nvfp4_mega_moe(
@@ -426,7 +430,35 @@ static void nvfp4_mega_moe(
         sym_buffer, sym_buffer_ptrs, rank_idx,
         num_max_tokens_per_rank, num_experts, num_topk,
         recipe, activation, activation_clamp_opt, fast_math,
-        true, expert_routing_map, kernel_profile);
+        MmaKind::NVFP4, expert_routing_map, kernel_profile);
+}
+
+static void mxfp4_mega_moe(
+    const torch::Tensor& y,
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l1_weights_tuple_opt,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l2_weights_tuple_opt,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::tuple<int, int, int>& recipe,
+    const std::string& activation,
+    const std::optional<float>& activation_clamp_opt,
+    const bool& fast_math,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& expert_routing_map,
+    const std::optional<torch::Tensor>& kernel_profile
+) {
+    low_precision_mega_moe(
+        y, l1_weights_tuple, l2_weights_tuple,
+        shared_l1_weights_tuple_opt, shared_l2_weights_tuple_opt,
+        cumulative_local_expert_recv_stats,
+        sym_buffer, sym_buffer_ptrs, rank_idx,
+        num_max_tokens_per_rank, num_experts, num_topk,
+        recipe, activation, activation_clamp_opt, fast_math,
+        MmaKind::MXFP4, expert_routing_map, kernel_profile);
 }
 
 static void bf16_mega_moe(
@@ -545,6 +577,7 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
     m.def("nvfp4_mega_moe", &nvfp4_mega_moe);
+    m.def("mxfp4_mega_moe", &mxfp4_mega_moe);
     m.def("bf16_mega_moe", &bf16_mega_moe);
 #endif
 }

@@ -63,8 +63,18 @@ static MmaKind parse_mma_kind(const std::string& mma_type_str) {
         return MmaKind::BF16;
     if (mma_type_str == "fp8xfp4")
         return MmaKind::MXFP8FP4;
-    DG_HOST_ASSERT(mma_type_str == "nvfp4xnvfp4");
-    return MmaKind::NVFP4;
+    if (mma_type_str == "nvfp4xnvfp4")
+        return MmaKind::NVFP4;
+    DG_HOST_ASSERT(mma_type_str == "mxfp4xmxfp4");
+    return MmaKind::MXFP4;
+}
+
+static bool is_packed_fp4_mma(const MmaKind& mma_kind) {
+    return mma_kind == MmaKind::NVFP4 or mma_kind == MmaKind::MXFP4;
+}
+
+static int get_mma_sf_gran_k(const MmaKind& mma_kind) {
+    return mma_kind == MmaKind::NVFP4 ? 16 : 32;
 }
 
 static int get_num_mma_elem_bytes(const MmaKind& mma_kind) {
@@ -72,19 +82,19 @@ static int get_num_mma_elem_bytes(const MmaKind& mma_kind) {
 }
 
 static int get_num_mma_smem_bytes(const int& num_elements, const MmaKind& mma_kind) {
-    DG_HOST_ASSERT(mma_kind != MmaKind::NVFP4 or num_elements % 2 == 0);
+    DG_HOST_ASSERT(not is_packed_fp4_mma(mma_kind) or num_elements % 2 == 0);
     return mma_kind == MmaKind::BF16 ? num_elements * 2 :
-           mma_kind == MmaKind::NVFP4 ? num_elements / 2 : num_elements;
+           is_packed_fp4_mma(mma_kind) ? num_elements / 2 : num_elements;
 }
 
 static bool is_mma_with_sf(const MmaKind& mma_kind) {
-    return mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::NVFP4;
+    return mma_kind == MmaKind::MXFP8FP4 or is_packed_fp4_mma(mma_kind);
 }
 
 static int get_num_token_bytes(const int& num_elements, const MmaKind& mma_kind) {
-    DG_HOST_ASSERT(mma_kind != MmaKind::NVFP4 or num_elements % 2 == 0);
+    DG_HOST_ASSERT(not is_packed_fp4_mma(mma_kind) or num_elements % 2 == 0);
     return mma_kind == MmaKind::BF16 ? num_elements * 2 :
-           mma_kind == MmaKind::NVFP4 ? num_elements / 2 : num_elements;
+           is_packed_fp4_mma(mma_kind) ? num_elements / 2 : num_elements;
 }
 
 static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
@@ -114,7 +124,7 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
             return {2, 192, 32, 128, 2};
         }
     }();
-    block_k = mma_kind == MmaKind::NVFP4 ? 256 : block_k / get_num_mma_elem_bytes(mma_kind);
+    block_k = is_packed_fp4_mma(mma_kind) ? 256 : block_k / get_num_mma_elem_bytes(mma_kind);
 
     // Check whether our `block_m` lies in `kCandidateBlockM`
     DG_HOST_ASSERT(std::any_of(
@@ -128,7 +138,7 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& smem_capacity,
-    const int& num_experts, const int& hidden,
+    const int& num_experts, const int& hidden, const int& num_tokens,
     const int& block_m, const int& block_n, const int& block_k, 
     const int& num_bytes_per_pull, const int& store_block_m,
     const int& sf_block_m, const int& sf_block_n, const int& gran_k,
@@ -191,14 +201,22 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     // Select a tuned stage count within the physical shared-memory capacity.
     const int max_num_stages = (smem_capacity - smem_fixed) / smem_size_per_stage;
     int num_stages = max_num_stages;
-    if (mma_kind == MmaKind::NVFP4) {
-        // EP8 stage sweeps favor nine stages for Block-M16/M32 and six for
-        // Block-M64. Larger tiles remain on the conservative unpacked-byte
-        // estimate until they have an equivalent promotion result.
-        if (block_m <= 32) {
+    if (is_packed_fp4_mma(mma_kind)) {
+        // EP8 stage sweeps favor ten stages for MXFP4 Block-M16, nine for
+        // Block-M32. MXFP4 Block-M64 needs eight stages for the shorter wave
+        // and nine once the per-rank token count reaches 160. Preserve the
+        // validated NVFP4 settings and keep larger tiles on the conservative
+        // unpacked-byte estimate until they have an equivalent promotion
+        // result.
+        if (block_m == 16) {
+            num_stages = std::min(
+                max_num_stages, mma_kind == MmaKind::MXFP4 ? 10 : 9);
+        } else if (block_m == 32) {
             num_stages = std::min(max_num_stages, 9);
         } else if (block_m == 64) {
-            num_stages = std::min(max_num_stages, 6);
+            const int tuned_num_stages = mma_kind == MmaKind::MXFP4 ?
+                (num_tokens >= 160 ? 9 : 8) : 6;
+            num_stages = std::min(max_num_stages, tuned_num_stages);
         } else {
             const int conservative_size_per_stage =
                 load_block_m * block_k + block_n * block_k +
@@ -241,7 +259,7 @@ static MegaMoEConfig get_mega_moe_config(
     // operands packed and uses a 256-element SW128 atom.
     const int swizzle_acts_mode = 128;
     const int swizzle_weights_mode = 128;
-    const int gran_k = mma_kind == MmaKind::NVFP4 ? 16 : 32;
+    const int gran_k = get_mma_sf_gran_k(mma_kind);
 
     // Thread layout
     const int num_dispatch_threads = 128;
@@ -258,7 +276,7 @@ static MegaMoEConfig get_mega_moe_config(
     // Pipeline
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe(
         SM100ArchSpec::smem_capacity,
-        num_experts, hidden,
+        num_experts, hidden, num_tokens,
         block_m, block_n, block_k, num_bytes_per_pull, store_block_m,
         sf_block_m, sf_block_n, gran_k,
         num_dispatch_threads / 32, num_epilogue_threads / 32,

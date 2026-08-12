@@ -38,7 +38,7 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
-    bool kUseNVFP4 = false,
+    uint32_t kFP4ScaleGranularity = 0,
     bool kUseEpochWorkspace = false,
     bool kUseExpertRoutingMap = false,
     uint32_t kDispatchReadyMode = 0,
@@ -91,24 +91,29 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
+    constexpr bool kUsePackedFP4 = kFP4ScaleGranularity != 0;
+    constexpr bool kUseNVFP4 = kFP4ScaleGranularity == 16;
+    constexpr bool kUseMXFP4 = kFP4ScaleGranularity == 32;
 
     // Template checks
+    DG_STATIC_ASSERT(kFP4ScaleGranularity == 0 or kUseNVFP4 or kUseMXFP4,
+                     "Packed FP4 scales must use group 16 or group 32");
     DG_STATIC_ASSERT(kNumDispatchThreads % 128 == 0, "Invalid number of dispatch threads");
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
-    DG_STATIC_ASSERT(not kUseEpochWorkspace or kUseNVFP4,
-                     "Epoch workspace is currently supported only by NVFP4 MegaMoE");
-    DG_STATIC_ASSERT(not kUseExpertRoutingMap or kUseNVFP4,
-                     "Expert routing maps are currently supported only by NVFP4 MegaMoE");
+    DG_STATIC_ASSERT(not kUseEpochWorkspace or kUsePackedFP4,
+                     "Epoch workspace is currently supported only by packed-FP4 MegaMoE");
+    DG_STATIC_ASSERT(not kUseExpertRoutingMap or kUsePackedFP4,
+                     "Expert routing maps are currently supported only by packed-FP4 MegaMoE");
     DG_STATIC_ASSERT(kDispatchReadyMode <= 4,
                      "Unsupported dispatch readiness mode");
-    DG_STATIC_ASSERT(kDispatchReadyMode == 0 or (kUseNVFP4 and kUseEpochWorkspace),
-                     "Barrierless dispatch readiness requires NVFP4 epoch workspace");
-    DG_STATIC_ASSERT(not kEnableKernelProfile or kUseNVFP4,
-                     "Kernel profiling is currently supported only by NVFP4 MegaMoE");
-    DG_STATIC_ASSERT(not kUseNVFP4 or not kHasShared,
-                     "NVFP4 MegaMoE does not yet support shared experts");
+    DG_STATIC_ASSERT(kDispatchReadyMode == 0 or (kUsePackedFP4 and kUseEpochWorkspace),
+                     "Barrierless dispatch readiness requires packed-FP4 epoch workspace");
+    DG_STATIC_ASSERT(not kEnableKernelProfile or kUsePackedFP4,
+                     "Kernel profiling is currently supported only by packed-FP4 MegaMoE");
+    DG_STATIC_ASSERT(not kUsePackedFP4 or not kHasShared,
+                     "Packed-FP4 MegaMoE does not yet support shared experts");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -200,7 +205,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumMaxTokensPerRank, kNumTopk,
         kNumRingTokens, kNumSFRingTokens,
         /*with_sf=*/ true,
-        /*use_nvfp4=*/ kUseNVFP4,
+        /*use_packed_fp4=*/ kUsePackedFP4,
+        /*sf_gran_k=*/ kUsePackedFP4 ? kFP4ScaleGranularity : 32,
         kNumSharedExperts
     );
     const auto workspace_layout = buffer.workspace;
@@ -216,7 +222,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const auto combine_token_buffer = buffer.combine_token_buffer;
 
     // SF and its buffer configs
-    constexpr uint32_t kGranK = kUseNVFP4 ? 16 : 32;
+    constexpr uint32_t kGranK = kUsePackedFP4 ? kFP4ScaleGranularity : 32;
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
     DG_STATIC_ASSERT(SF_BLOCK_M == math::constexpr_align(BLOCK_M, kNumUTCCPAlignedElems), "Invalid SF_BLOCK_M");
     DG_STATIC_ASSERT(SF_BLOCK_N == BLOCK_N, "No padding is needed for SFB");
@@ -231,11 +237,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Data types
     // TMA unpacks packed FP4 payloads to one byte per element in shared
     // memory. The legacy path keeps FP8 activations and FP4 weights.
-    using a_dtype_t = std::conditional_t<kUseNVFP4,
+    using a_dtype_t = std::conditional_t<kUsePackedFP4,
         cutlass::detail::float_e2m1_unpacksmem_t, cutlass::float_e4m3_t>;
     using b_dtype_t = cutlass::detail::float_e2m1_unpacksmem_t;
-    using a_smem_dtype_t = std::conditional_t<kUseNVFP4, cutlass::float_e2m1_t, a_dtype_t>;
-    using b_smem_dtype_t = std::conditional_t<kUseNVFP4, cutlass::float_e2m1_t, b_dtype_t>;
+    using a_smem_dtype_t = std::conditional_t<kUsePackedFP4, cutlass::float_e2m1_t, a_dtype_t>;
+    using b_smem_dtype_t = std::conditional_t<kUsePackedFP4, cutlass::float_e2m1_t, b_dtype_t>;
     using shared_a_dtype_t = cutlass::float_e4m3_t;
     using shared_b_dtype_t = cutlass::float_e4m3_t;
 
@@ -244,8 +250,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t LAYOUT_AD_M = 128;
     constexpr uint32_t UMMA_M = LAYOUT_AD_M * 2;
     constexpr uint32_t UMMA_N = BLOCK_M;  // Swap AB
-    constexpr uint32_t UMMA_DESC_BLOCK_K = kUseNVFP4 ? 256 : 128;
-    constexpr uint32_t UMMA_K = kUseNVFP4 ? 64 : 32;
+    constexpr uint32_t UMMA_DESC_BLOCK_K = kUsePackedFP4 ? 256 : 128;
+    constexpr uint32_t UMMA_K = kUsePackedFP4 ? 64 : 32;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / 2;  // Multicast on A
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N;
     DG_STATIC_ASSERT(BLOCK_M % 16 == 0, "Invalid block M");
@@ -281,8 +287,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             alignas(kSharedMemoryAlignment) a_dtype_t l1[kNumEpilogueWarpgroups][kNumTMAStoreStages][STORE_BLOCK_M * L1_OUT_BLOCK_N];
             alignas(kSharedMemoryAlignment) nv_bfloat16 l2[kNumEpilogueWarpgroups][STORE_BLOCK_M * BLOCK_N];
         } smem_d;
-        alignas(kSharedMemoryAlignment) a_smem_dtype_t smem_a[kNumStages][LOAD_BLOCK_M * BLOCK_K / (kUseNVFP4 ? 2 : 1)];
-        alignas(kSharedMemoryAlignment) b_smem_dtype_t smem_b[kNumStages][LOAD_BLOCK_N * BLOCK_K / (kUseNVFP4 ? 2 : 1)];
+        alignas(kSharedMemoryAlignment) a_smem_dtype_t smem_a[kNumStages][LOAD_BLOCK_M * BLOCK_K / (kUsePackedFP4 ? 2 : 1)];
+        alignas(kSharedMemoryAlignment) b_smem_dtype_t smem_b[kNumStages][LOAD_BLOCK_N * BLOCK_K / (kUsePackedFP4 ? 2 : 1)];
         uint32_t smem_sfa[kNumStages][SF_BLOCK_M * (BLOCK_K / (kGranK * 4))];
         uint32_t smem_sfb[kNumStages][SF_BLOCK_N * (BLOCK_K / (kGranK * 4))];
         float2 amax_reduction[kNumEpilogueWarps][AMAX_REDUCTION_WARP_BUFFER_SIZE];
@@ -312,7 +318,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kNumAccumTmemCols = UMMA_N * kNumEpilogueStages;
     constexpr uint32_t kNumSFATmemColsPerSet = SF_BLOCK_M / 32;
     constexpr uint32_t kNumSFBTmemColsPerSet = SF_BLOCK_N / 32;
-    constexpr uint32_t kNumSFTmemSets = kUseNVFP4 ? UMMA_DESC_BLOCK_K / UMMA_K : 1;
+    constexpr uint32_t kNumSFTmemSets = kUsePackedFP4 ? UMMA_DESC_BLOCK_K / (kGranK * 4) : 1;
     constexpr uint32_t kNumSFATmemCols = kNumSFATmemColsPerSet * kNumSFTmemSets;
     constexpr uint32_t kNumSFBTmemCols = kNumSFBTmemColsPerSet * kNumSFTmemSets;
     constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kNumAccumTmemCols + kNumSFATmemCols + kNumSFBTmemCols>();
@@ -748,7 +754,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
             // Hidden bytes are divided into chunks
-            constexpr uint32_t kNumInputTokenBytes = kUseNVFP4 ? kHidden / 2 : kHidden;
+            constexpr uint32_t kNumInputTokenBytes = kUsePackedFP4 ? kHidden / 2 : kHidden;
             constexpr uint32_t kNumChunks = kNumInputTokenBytes / kNumBytesPerPull;
             DG_STATIC_ASSERT(kNumChunks * kNumBytesPerPull == kNumInputTokenBytes,
                              "kNumBytesPerPull must divide token bytes");
@@ -1008,7 +1014,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // TMA copy tokens and SFA, then arrive at full barrier
                 if (cute::elect_one_sync()) {
-                    if constexpr (kUseNVFP4) {
+                    if constexpr (kUsePackedFP4) {
                         tma::copy_packed_fp4<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode>(
                             tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx],
                             reinterpret_cast<uint8_t*>(shared_storage.smem_a[stage_idx]),
@@ -1086,7 +1092,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             shared_storage.full_barriers[stage_idx].arrive(0u);
                         }
                     } else {
-                        if constexpr (kUseNVFP4) {
+                        if constexpr (kUsePackedFP4) {
                             tma::copy_packed_fp4<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode>(
                                 tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx],
                                 reinterpret_cast<uint8_t*>(shared_storage.smem_b[stage_idx]),
@@ -1100,7 +1106,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
                         if (is_leader_cta) {
                             constexpr uint32_t kBClusterTransactionBytes =
-                                sizeof(SharedStorage::smem_b[0]) * (kUseNVFP4 ? 2 : 1);
+                                sizeof(SharedStorage::smem_b[0]) * (kUsePackedFP4 ? 2 : 1);
                             shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
                                 kBClusterTransactionBytes + sizeof(SharedStorage::smem_sfb[0]) * 2);
                         } else {
@@ -1119,8 +1125,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (is_leader_cta) {
             // Make instruction descriptor with block scaling
             // NOTES: always swap A/B
-            using instr_a_dtype_t = std::conditional_t<kUseNVFP4, cutlass::float_e2m1_t, b_dtype_t>;
-            using instr_b_dtype_t = std::conditional_t<kUseNVFP4, cutlass::float_e2m1_t, a_dtype_t>;
+            using instr_a_dtype_t = std::conditional_t<kUsePackedFP4, cutlass::float_e2m1_t, b_dtype_t>;
+            using instr_b_dtype_t = std::conditional_t<kUsePackedFP4, cutlass::float_e2m1_t, a_dtype_t>;
             using sf_dtype_t = std::conditional_t<kUseNVFP4, cutlass::float_ue4m3_t, cutlass::float_ue8m0_t>;
             auto routed_instr_desc = cute::UMMA::make_instr_desc_block_scaled<
                 instr_a_dtype_t, instr_b_dtype_t, float, sf_dtype_t,
@@ -1142,7 +1148,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 cute::UMMA::Major::K, LOAD_BLOCK_N, UMMA_DESC_BLOCK_K, kSwizzleBMode>(
                     shared_storage.smem_b[0], 0, 0);
             auto shared_b_desc = [&]() {
-                if constexpr (kUseNVFP4) {
+                if constexpr (kUsePackedFP4) {
                     return b_desc;
                 } else {
                     return mma::sm100::make_umma_desc<
@@ -1220,23 +1226,38 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 }
                             };
 
-                            // MXFP8 uses four K32 instructions sharing one packed
-                            // SF word. NVFP4 uses one word of four group-16 UE4M3
-                            // scales for every K64 instruction.
+                            // MXFP8 shares one SF word across all four K32
+                            // instructions. NVFP4 preserves its validated
+                            // group-16 publication order. MXFP4 publishes each
+                            // independent group-32 TMEM set immediately before
+                            // its first consumer below; this lets the next
+                            // set's UTCCP overlap the prior set's MMA instead of
+                            // serializing every scale copy in the critical
+                            // prefix.
                             if constexpr (kUseNVFP4) {
                                 #pragma unroll
                                 for (uint32_t sf_set_idx = 0; sf_set_idx < kNumSFTmemSets; ++ sf_set_idx)
                                     copy_sf_to_tmem(
                                         umma_k_block_idx * kNumSFTmemSets + sf_set_idx,
                                         sf_set_idx);
-                            } else {
+                            } else if constexpr (not kUsePackedFP4) {
                                 copy_sf_to_tmem(umma_k_block_idx, 0);
                             }
                             #pragma unroll
                             for (uint32_t k = 0; k < UMMA_DESC_BLOCK_K / UMMA_K; ++ k) {
+                                if constexpr (kUseMXFP4) {
+                                    if (k % 2 == 0) {
+                                        const uint32_t sf_set_idx = k / 2;
+                                        copy_sf_to_tmem(
+                                            umma_k_block_idx * kNumSFTmemSets + sf_set_idx,
+                                            sf_set_idx);
+                                    }
+                                }
                                 const auto runtime_instr_desc =
                                     mma::sm100::make_runtime_instr_desc_with_sf_id(
-                                        instr_desc, kUseNVFP4 ? 0u : k, kUseNVFP4 ? 0u : k);
+                                        instr_desc,
+                                        kUseNVFP4 ? 0u : kUseMXFP4 ? (k % 2) * 2 : k,
+                                        kUseNVFP4 ? 0u : kUseMXFP4 ? (k % 2) * 2 : k);
                                 a_desc.lo = mma::sm100::advance_umma_desc_lo<
                                     cute::UMMA::Major::K, LOAD_BLOCK_M, kSwizzleAMode, a_smem_dtype_t>(
                                         a_desc_base_lo,
@@ -1261,6 +1282,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                         k_block_idx > 0 or umma_k_block_idx > 0 or k > 0, runtime_instr_desc,
                                         kTmemStartColOfSFB + k * kNumSFBTmemColsPerSet,
                                         kTmemStartColOfSFA + k * kNumSFATmemColsPerSet);
+                                } else if constexpr (kUseMXFP4) {
+                                    ptx::SM100_MMA_MXF4_2x1SM_SS::fma(
+                                        b_desc, a_desc, accum_stage_idx * UMMA_N,
+                                        k_block_idx > 0 or umma_k_block_idx > 0 or k > 0, runtime_instr_desc,
+                                        kTmemStartColOfSFB + (k / 2) * kNumSFBTmemColsPerSet,
+                                        kTmemStartColOfSFA + (k / 2) * kNumSFATmemColsPerSet);
                                 } else {
                                     ptx::SM100_MMA_MXF8F6F4_2x1SM_SS::fma(
                                         b_desc, a_desc, accum_stage_idx * UMMA_N,
@@ -1479,12 +1506,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // Wait shared memory release from previous TMA store
                     // And fence `shared_storage.amax_reduction`
                     const uint32_t tma_stage_idx = s % kNumTMAStoreStages;
-                    if constexpr (not kUseNVFP4)
+                    if constexpr (not kUsePackedFP4)
                         ptx::tma_store_wait<kNumTMAStoreStages - 1>();
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
                     // Quantize the post-SwiGLU activation and store unpacked
-                    // bytes into shared memory. TMA packs them on NVFP4 stores.
+                    // bytes into shared memory for the output stage.
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
                         if constexpr (not kUseNVFP4) {
@@ -1516,6 +1543,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             }
                             sf_inv.x = __shfl_sync(0xffffffff, sf_inv.x, lane_idx % 4);
                             sf_inv.y = __shfl_sync(0xffffffff, sf_inv.y, lane_idx % 4);
+                        } else if constexpr (kUseMXFP4) {
+                            math::get_e2m1_sf_and_sf_inv(amax_values[i], sf, sf_inv);
                         } else {
                             math::get_e4m3_sf_and_sf_inv(amax_values[i], sf, sf_inv);
                         }
@@ -1532,7 +1561,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             + row * L1_OUT_BLOCK_N
                             // Use 64B swizzle for SwiGLU, so divided by 2
                             + (col ^ (row / 2)) * kNumBankGroupBytes;
-                        if constexpr (kUseNVFP4) {
+                        if constexpr (kUsePackedFP4) {
                             const cutlass::Array<float, 4> fp32x4 = {upper.x, upper.y, lower.x, lower.y};
                             const auto fp4x4 = cutlass::NumericArrayConverter<
                                 cutlass::float_e2m1_t, float, 4>()(fp32x4);
@@ -1550,8 +1579,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         }
 
                         // Store packed SF to `l2_sf_buffer` in MN-major layout.
-                        // MXFP8 has one writer per warp pair; NVFP4 has one
-                        // group-16 scale per warp.
+                        // Group-32 MXFP8/MXFP4 has one writer per warp pair;
+                        // group-16 NVFP4 has one scale writer per warp.
                         // Each lane < 4 holds SF for 2 rows (sf.x and sf.y)
                         if ((kUseNVFP4 or warp_idx_in_wg % 2 == 0) and lane_idx < 4) {
                             const uint32_t k_idx = kUseNVFP4 ?
@@ -1583,7 +1612,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
-                    if constexpr (kUseNVFP4) {
+                    if constexpr (kUsePackedFP4) {
                         // The FP4 TMA unpacked format requires an inner box of
                         // at least 128 logical elements. Post-SwiGLU is only 64
                         // elements wide, so cooperatively pack adjacent nibbles
@@ -1630,7 +1659,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // Notify L2 and increment L1 empty count
                 // TODO: less epilogue sync scope
-                if constexpr (not kUseNVFP4)
+                if constexpr (not kUsePackedFP4)
                     ptx::tma_store_wait<0>();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {

@@ -21,6 +21,7 @@ struct SM100ArchSpec {
             case MmaKind::BF16: return {0, 0};
             case MmaKind::MXFP8FP4: return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
             case MmaKind::NVFP4: return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
+            case MmaKind::MXFP4: return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
             default: DG_HOST_UNREACHABLE("Unknown dtype");
         }
     }

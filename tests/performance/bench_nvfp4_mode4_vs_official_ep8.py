@@ -35,7 +35,6 @@ from deep_gemm.utils.dist import init_dist
 OFFICIAL_BASE_COMMIT = "559d79fb6994a58b8a15b4b93bf13ccc16edf247"
 MODE_ENV = "DG_NVFP4_MEGAMOE_DISPATCH_READY_MODE"
 EPOCH_ENV = "DG_NVFP4_MEGAMOE_EPOCH_WORKSPACE"
-GROUPED_SF_ENV = "DG_NVFP4_MEGAMOE_WARP_RECIPROCAL_TABLE"
 
 PROFILE_STAGES = (
     ("gemm_l1", "stage_gemm_l1"),
@@ -270,7 +269,6 @@ def _run_rank(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -
         if args.candidate_contract == "nvfp4"
         else per_token_cast_to_mxfp4
     )
-    assert not args.compare_grouped_sf_reuse or args.candidate_contract == "nvfp4"
     torch.manual_seed(args.seed + rank)
     random.seed(args.seed + rank)
 
@@ -353,9 +351,7 @@ def _run_rank(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -
         )
 
     def run_mode0(stats=None) -> None:
-        _set_nvfp4_mode(4 if args.compare_grouped_sf_reuse else 0)
-        if args.compare_grouped_sf_reuse:
-            os.environ[GROUPED_SF_ENV] = "0"
+        _set_nvfp4_mode(0)
         candidate_api(
             y=mode0_y,
             l1_weights=candidate_weights[0],
@@ -368,8 +364,6 @@ def _run_rank(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -
 
     def run_mode4(stats=None, kernel_profile=None) -> None:
         _set_nvfp4_mode(4)
-        if args.compare_grouped_sf_reuse:
-            os.environ[GROUPED_SF_ENV] = "1"
         candidate_api(
             y=mode4_y,
             l1_weights=candidate_weights[0],
@@ -648,7 +642,7 @@ def main() -> None:
     parser.add_argument("--num-experts", type=int, default=512)
     parser.add_argument("--num-topk", type=int, default=10)
     parser.add_argument(
-        "--candidate-contract", choices=("nvfp4", "mxfp4"), default="mxfp4"
+        "--candidate-contract", choices=("nvfp4", "mxfp4"), default="nvfp4"
     )
     parser.add_argument("--activation-clamp", type=float, default=10.0)
     parser.add_argument("--fast-math", type=int, choices=(0, 1), default=1)
@@ -660,7 +654,6 @@ def main() -> None:
     parser.add_argument("--cuda-graph-replays", type=int, default=0)
     parser.add_argument("--mode0-warmup", type=int, default=0)
     parser.add_argument("--mode0-repeat", type=int, default=0)
-    parser.add_argument("--compare-grouped-sf-reuse", action="store_true")
     parser.add_argument("--kernel-profile-repeats", type=int, default=0)
     parser.add_argument("--ncu-profile-only", choices=("official", "candidate"))
     parser.add_argument("--external-rank", type=int)

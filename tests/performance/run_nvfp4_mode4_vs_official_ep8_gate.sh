@@ -14,7 +14,8 @@ mkdir -p "${result_dir}"
 export PYTHONPATH="${repo_dir}${PYTHONPATH:+:${PYTHONPATH}}"
 export DG_JIT_CACHE_DIR="${DG_JIT_CACHE_DIR:-/tmp/deepgemm_nvfp4_mode4_ep8_gate_jit}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
-candidate_contract="${CANDIDATE_CONTRACT:-mxfp4}"
+candidate_contract="${CANDIDATE_CONTRACT:-nvfp4}"
+test "${candidate_contract}" = "nvfp4"
 
 for mask in 0.5 1.0; do
   tag="${mask/./}"

@@ -54,6 +54,8 @@ def main() -> None:
 
     for input_name in args.inputs:
         result = load_json(input_name)
+        assert result["candidate"]["quantization_contract"] == "nvfp4"
+        assert result["candidate"]["entrypoint"] == "deep_gemm.nvfp4_mega_moe"
         assert_common_correctness(result)
         assert result["timing"] is not None
         shape = int(result["shape"]["tokens_per_rank"])
@@ -121,6 +123,8 @@ def main() -> None:
     stress_pass = True
     for input_name in args.stress_inputs:
         result = load_json(input_name)
+        assert result["candidate"]["quantization_contract"] == "nvfp4"
+        assert result["candidate"]["entrypoint"] == "deep_gemm.nvfp4_mega_moe"
         assert_common_correctness(result)
         mask = float(result["masked_route_fraction"])
         observed_masks.add(mask)

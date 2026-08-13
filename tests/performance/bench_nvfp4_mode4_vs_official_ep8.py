@@ -297,6 +297,78 @@ def _run_rank(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -
         topk_idx.masked_fill_(mask, -1)
         topk_weights.masked_fill_(mask, 0.0)
 
+    if args.ncu_profile_only:
+        buffer_args = dict(
+            group=group,
+            num_experts=args.num_experts,
+            num_max_tokens_per_rank=args.num_tokens,
+            num_topk=args.num_topk,
+            hidden=args.hidden,
+            intermediate_hidden=args.intermediate_hidden,
+        )
+        y = torch.empty(
+            (args.num_tokens, args.hidden), dtype=torch.bfloat16, device="cuda"
+        )
+        kernel_profile = None
+        if args.ncu_candidate_kernel_profile and args.ncu_profile_only == "candidate":
+            kernel_profile = deep_gemm.allocate_mega_moe_kernel_profile()
+        if args.ncu_profile_only == "official":
+            x_profile = per_token_cast_to_fp8(
+                x_bf16, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+            )
+            weights = official_deep_gemm.transform_weights_for_mega_moe(
+                _cast_weights_to_fp4(l1_bf16, official_deep_gemm),
+                _cast_weights_to_fp4(l2_bf16, official_deep_gemm),
+            )
+            sym_buffer = official_deep_gemm.get_symm_buffer_for_mega_moe(
+                **buffer_args, mma_type="fp8xfp4"
+            )
+
+            def run_profile() -> None:
+                official_deep_gemm.fp8_fp4_mega_moe(
+                    y=y,
+                    l1_weights=weights[0],
+                    l2_weights=weights[1],
+                    sym_buffer=sym_buffer,
+                    activation_clamp=args.activation_clamp,
+                    fast_math=bool(args.fast_math),
+                )
+        else:
+            x_profile = candidate_quantize(x_bf16)
+            weights = deep_gemm.transform_weights_for_mega_moe(
+                _cast_weights_to_packed_fp4(l1_bf16, args.candidate_contract),
+                _cast_weights_to_packed_fp4(l2_bf16, args.candidate_contract),
+            )
+            sym_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+                **buffer_args, mma_type=candidate_mma_type
+            )
+
+            def run_profile() -> None:
+                _set_nvfp4_mode(4)
+                candidate_api(
+                    y=y,
+                    l1_weights=weights[0],
+                    l2_weights=weights[1],
+                    sym_buffer=sym_buffer,
+                    activation_clamp=args.activation_clamp,
+                    fast_math=bool(args.fast_math),
+                    kernel_profile=kernel_profile,
+                )
+
+        del l1_bf16, l2_bf16, scores, x_bf16
+        _copy_routes_and_inputs(sym_buffer, x_profile, topk_idx, topk_weights)
+        torch.cuda.synchronize()
+        if not args.ncu_profile_from_start:
+            torch.cuda.cudart().cudaProfilerStart()
+        run_profile()
+        torch.cuda.synchronize()
+        if not args.ncu_profile_from_start:
+            torch.cuda.cudart().cudaProfilerStop()
+        dist.barrier(group=group)
+        sym_buffer.destroy()
+        dist.destroy_process_group()
+        return
+
     x_fp8 = per_token_cast_to_fp8(
         x_bf16, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
     )
@@ -374,22 +446,6 @@ def _run_rank(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -
             fast_math=bool(args.fast_math),
             kernel_profile=kernel_profile,
         )
-
-    if args.ncu_profile_only:
-        torch.cuda.synchronize()
-        torch.cuda.cudart().cudaProfilerStart()
-        if args.ncu_profile_only == "official":
-            run_official()
-        else:
-            run_mode4()
-        torch.cuda.synchronize()
-        torch.cuda.cudart().cudaProfilerStop()
-        dist.barrier(group=group)
-        official_buffer.destroy()
-        mode0_buffer.destroy()
-        mode4_buffer.destroy()
-        dist.destroy_process_group()
-        return
 
     # Compile all three variants before correctness or timing begins.
     run_official()
@@ -656,6 +712,8 @@ def main() -> None:
     parser.add_argument("--mode0-repeat", type=int, default=0)
     parser.add_argument("--kernel-profile-repeats", type=int, default=0)
     parser.add_argument("--ncu-profile-only", choices=("official", "candidate"))
+    parser.add_argument("--ncu-candidate-kernel-profile", action="store_true")
+    parser.add_argument("--ncu-profile-from-start", action="store_true")
     parser.add_argument("--external-rank", type=int)
     parser.add_argument("--json-output", required=True)
     args = parser.parse_args()

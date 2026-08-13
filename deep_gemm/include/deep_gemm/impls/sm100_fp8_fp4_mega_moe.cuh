@@ -426,7 +426,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kEpilogueWGBarrierStartIdx = 3;
     constexpr uint32_t kDispatchReadyCacheBarrierIdx =
         kEpilogueWGBarrierStartIdx + kNumEpilogueWarpgroups;
-    DG_STATIC_ASSERT(kDispatchReadyCacheBarrierIdx < 16,
+    constexpr uint32_t kCombineWarpBarrierStartIdx =
+        kDispatchReadyCacheBarrierIdx + 1;
+    DG_STATIC_ASSERT(kCombineWarpBarrierStartIdx + kNumEpilogueWarps <= 16,
                      "Insufficient named barriers for readiness cache");
 
     // NVLink barrier tags
@@ -1421,6 +1423,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
                         const uint32_t j = s * kNumAtomsPerStore + i;
+                        const uint32_t atom_m_idx =
+                            epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M;
+                        if (atom_m_idx >= valid_m) {
+                            if (j == WG_BLOCK_M / ATOM_M - 1) {
+                                ptx::tcgen05_before_thread_sync();
+                                shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
+                            }
+                            continue;
+                        }
 
                         // Load weights from global into register cache per 32 tokens
                         DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
@@ -1514,6 +1525,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // bytes into shared memory for the output stage.
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
+                        const uint32_t token_base_idx =
+                            epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
+                        if (token_base_idx >= valid_m)
+                            continue;
+
                         if constexpr (not kUseNVFP4) {
                             // MXFP8 uses one group-32 scale shared by a warp pair.
                             const float2 wp_amax =
@@ -1598,15 +1614,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             //   1. `task_info.m_block_idx * BLOCK_M` mod `BLOCK_M` is 0, and `epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M + lane_idx * 2` is always < `BLOCK_M`, so we can put `task_info.m_block_idx * BLOCK_M` outside
                             //   2. `lane_idx * 2` controls the lowest 3 bit of `token_idx_in_expert`, and `transform_sf_token_idx` is a bitwise-independent transformation if the input is less than `BLOCK_M`, so we can put `lane_idx * 2` outside
                             // This reduce the number of computation instructions.
-                            const uint32_t token_base_idx = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
                             __builtin_assume(token_base_idx < BLOCK_M);
                             const auto sf_token_idx = block_idx * SF_BLOCK_M
                                 + transform_sf_token_idx(token_base_idx) + (lane_idx * 2) * 4;
                             const auto sf_addr = k_uint_idx * mn_stride + sf_token_idx * static_cast<uint32_t>(sizeof(uint32_t)) + byte_idx;
-                            sf_base_ptr[sf_addr] = kUseNVFP4 ? sf_code_x :
-                                (*reinterpret_cast<const uint32_t*>(&sf.x) >> 23);
-                            sf_base_ptr[sf_addr + 4 * static_cast<uint32_t>(sizeof(uint32_t))] = kUseNVFP4 ? sf_code_y :
-                                (*reinterpret_cast<const uint32_t*>(&sf.y) >> 23);
+                            if constexpr (kUseNVFP4) {
+                                const uint32_t row_in_block = token_base_idx + lane_idx * 2;
+                                if (row_in_block < valid_m)
+                                    sf_base_ptr[sf_addr] = sf_code_x;
+                                if (row_in_block + 1 < valid_m)
+                                    sf_base_ptr[sf_addr + 4 * static_cast<uint32_t>(sizeof(uint32_t))] = sf_code_y;
+                            } else {
+                                sf_base_ptr[sf_addr] =
+                                    (*reinterpret_cast<const uint32_t*>(&sf.x) >> 23);
+                                sf_base_ptr[sf_addr + 4 * static_cast<uint32_t>(sizeof(uint32_t))] =
+                                    (*reinterpret_cast<const uint32_t*>(&sf.y) >> 23);
+                            }
                         }
                         __syncwarp();
                     }
@@ -1618,16 +1641,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // elements wide, so cooperatively pack adjacent nibbles
                         // and write the local ring buffer directly.
                         constexpr uint32_t kPackedBytesPerRow = L1_OUT_BLOCK_N / 2;
+                        constexpr uint32_t kPackedWordsPerRow = kPackedBytesPerRow / sizeof(uint32_t);
                         const uint32_t wg_thread_idx = warp_idx_in_wg * 32 + lane_idx;
                         const auto smem_base = reinterpret_cast<const uint8_t*>(
                             shared_storage.smem_d.l1[epilogue_wg_idx][tma_stage_idx]);
+                        const uint32_t store_m_idx =
+                            epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M;
+                        const uint32_t num_valid_rows = cute::min(valid_m - store_m_idx, STORE_BLOCK_M);
                         #pragma unroll
-                        for (uint32_t packed_idx = wg_thread_idx;
-                             packed_idx < STORE_BLOCK_M * kPackedBytesPerRow;
-                             packed_idx += 128) {
-                            const uint32_t row_in_store = packed_idx / kPackedBytesPerRow;
-                            const uint32_t packed_col = packed_idx % kPackedBytesPerRow;
-                            const uint32_t logical_col = packed_col * 2;
+                        for (uint32_t packed_word_idx = wg_thread_idx;
+                             packed_word_idx < num_valid_rows * kPackedWordsPerRow;
+                             packed_word_idx += 128) {
+                            const uint32_t row_in_store = packed_word_idx / kPackedWordsPerRow;
+                            const uint32_t packed_word_col = packed_word_idx % kPackedWordsPerRow;
+                            const uint32_t logical_col = packed_word_col * 8;
                             const uint32_t bank_group = logical_col / kNumBankGroupBytes;
                             const uint32_t col_in_bank_group = logical_col % kNumBankGroupBytes;
                             constexpr uint32_t kNumBankGroups =
@@ -1636,12 +1663,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 (row_in_store / 2) % kNumBankGroups;
                             const uint32_t physical_col =
                                 (bank_group ^ swizzle_row) * kNumBankGroupBytes + col_in_bank_group;
-                            const auto lo = smem_base[row_in_store * L1_OUT_BLOCK_N + physical_col] & 0x0f;
-                            const auto hi = smem_base[row_in_store * L1_OUT_BLOCK_N + physical_col + 1] & 0x0f;
+                            uint64_t packed = *reinterpret_cast<const uint64_t*>(
+                                smem_base + row_in_store * L1_OUT_BLOCK_N + physical_col);
+                            packed &= 0x0f0f0f0f0f0f0f0full;
+                            packed = (packed | (packed >> 4)) & 0x00ff00ff00ff00ffull;
+                            packed = (packed | (packed >> 8)) & 0x0000ffff0000ffffull;
+                            packed = (packed | (packed >> 16)) & 0x00000000ffffffffull;
                             const uint32_t ring_token_idx = ring_m_idx + epilogue_wg_idx * WG_BLOCK_M +
                                 s * STORE_BLOCK_M + row_in_store;
-                            auto dst = l2_token_buffer.get_data_buffer(ring_token_idx).template get_base_ptr<uint8_t>();
-                            dst[n_block_idx * kPackedBytesPerRow + packed_col] = lo | (hi << 4);
+                            auto dst = l2_token_buffer.get_data_buffer(ring_token_idx).template get_base_ptr<uint32_t>();
+                            dst[n_block_idx * kPackedWordsPerRow + packed_word_col] = static_cast<uint32_t>(packed);
                         }
                     } else if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
                         const uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N;
@@ -1972,7 +2003,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // Wait share memory release and write
                     if (j == 0) {
                         ptx::tma_store_wait<0>();
-                        __syncwarp();
+                        if constexpr (kNumStages >= 9) {
+                            ptx::sync_unaligned(
+                                32, kCombineWarpBarrierStartIdx + epilogue_warp_idx);
+                        } else {
+                            __syncwarp();
+                        }
                     }
                     ptx::st_shared(combine_store_buffer + j * 32 + lane_idx,
                                    casted.x, casted.y, casted.z, casted.w);

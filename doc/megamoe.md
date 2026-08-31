@@ -241,3 +241,39 @@ rank1 写 buf[0][t0] = E2输出      ← 覆盖！
 3. **无法用同步救** ：写入是 `float4` 的 bf16 向量，没有对应的原子加指令；改成跨卡加锁的话，每个输出行都要一次远程 CAS，性能直接崩掉。
 
 而且即便侥幸不覆盖，**权重也会配错** —— `topk_weights[t0][0] = 0.7` 是给 E0 的，若 E2 的结果落在 slot 0，下游就会用 0.7 去乘 E2 的输出。
+
+## 1.5 scheduler
+
+MoE计算过程分成多个wave，一个wave完整处理多个expert，一个wave包含两个phase，第一个是L1，第二个是L2，先处理完成一个expert，再处理下一个expert，同一个expert内部按照先N方向后M方向的顺序遍历，所有sm按照sm_id得到自己要处理的block。
+
+get_num_experts_per_wave_for_mega_moe会计算出一个wave是多少个expert，基本原理就是在能打满所有sm的前提下，expert越少越好，这样可以让L2尽快开始。
+
+# 二 整体流程
+
+## 2.1 流程简述
+
+**[kernel 外] pre_dispatch: bf16 token → 量化 → 本 rank input_token_buffer{x, x_sf, topk_idx, topk_weights}**
+
+**  → 源 rank 推 metadata 到远端(src_token_topk_idx + expert_recv_count/sum)**
+
+**  → NVLink barrier (kBeforeDispatchPullBarrierTag)**
+
+**  → 目标 rank 按 metadata pull token/SF/weight (一 token 一源 rank，round-robin 摊开)**
+
+**  → L1 token ring pool (per-expert BLOCK_M 对齐)  ──l1_full_count──▶**
+
+**  → L1 GEMM (FP8×FP4 或 FP4×FP4)**
+
+**  → SwiGLU → × route weight → 量化(FP8 或 FP4)**
+
+**  → L2 token ring pool  ──l2_full_count──▶     ──l1_empty_count──▶ 回收 L1 槽位**
+
+**  → L2 GEMM**
+
+**  → L2 epilogue: BF16 → 按 token_src_metadata 推回**源 rank**的 combine_token_buffer[topk_slot][token]**
+
+**  → NVLink barrier (kBeforeCombineReduceBarrierTag)**
+
+**  → 源 rank 本地 reduce: 遍历 topk_slot 求和(FP32 累加)**
+
+**  → BF16 cast → TMA store → y[token, hidden]**

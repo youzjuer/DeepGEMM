@@ -252,28 +252,54 @@ get_num_experts_per_wave_for_mega_moe会计算出一个wave是多少个expert，
 
 ## 2.1 流程简述
 
-**[kernel 外] pre_dispatch: bf16 token → 量化 → 本 rank input_token_buffer{x, x_sf, topk_idx, topk_weights}**
+整条流水线分成四段：**dispatch → L1 → L2 → combine**。段间衔接只有两种手段 —— 跨 rank 用 NVLink barrier，同 rank 内用 workspace 上的 full / empty 计数器做生产者-消费者握手。
 
-**  → 源 rank 推 metadata 到远端(src_token_topk_idx + expert_recv_count/sum)**
+```text
+【kernel 外】pre_dispatch
+     bf16 token ──量化──▶ input_token_buffer{ x, x_sf, topk_idx, topk_weights }
+     · 数据留在本 rank 等人来拉，不主动推送
 
-**  → NVLink barrier (kBeforeDispatchPullBarrierTag)**
+【dispatch】
+  1. 源 rank 推 metadata 到远端
+        src_token_topk_idx + expert_recv_count / expert_recv_count_sum
+  2. NVLink barrier ── kBeforeDispatchPullBarrierTag
+  3. 目标 rank 按 metadata pull token / SF / weight
+        一个 token 只对应一个源 rank；round-robin 在 token 之间摊开以打满 NVLink
+  4. 写入 L1 token ring pool（per-expert 按 BLOCK_M 对齐）
+        ──l1_full_count──▶ 通知 L1 可以开算
 
-**  → 目标 rank 按 metadata pull token/SF/weight (一 token 一源 rank，round-robin 摊开)**
+【L1】
+  5. L1 GEMM ── FP8×FP4 或 FP4×FP4
+  6. L1 epilogue ── SwiGLU → × route weight → 量化(FP8 或 FP4)
+  7. 写入 L2 token ring pool
+        ──l2_full_count──▶ 通知 L2 可以开算
+        ──l1_empty_count──▶ 回收 L1 槽位
 
-**  → L1 token ring pool (per-expert BLOCK_M 对齐)  ──l1_full_count──▶**
+【L2】
+  8. L2 GEMM
+        ──l2_empty_count──▶ 回收 L2 槽位
+  9. L2 epilogue ── 累加器转 BF16，按 token_src_metadata 推回
+        源 rank 的 combine_token_buffer[topk_slot][token]
+ 10. NVLink barrier ── kBeforeCombineReduceBarrierTag
 
-**  → L1 GEMM (FP8×FP4 或 FP4×FP4)**
+【combine】
+ 11. 源 rank 本地 reduce ── 遍历 topk_slot，FP32 累加
+ 12. BF16 cast → TMA store → y[token, hidden]
+```
 
-**  → SwiGLU → × route weight → 量化(FP8 或 FP4)**
+分段对照：
 
-**  → L2 token ring pool  ──l2_full_count──▶     ──l1_empty_count──▶ 回收 L1 槽位**
+| 阶段 | 谁在做 | 产物落在哪 | 与下一段的衔接 |
+| --- | --- | --- | --- |
+| pre_dispatch | 独立 kernel（在 MegaMoE 之外） | 本 rank `input_token_buffer` | —— |
+| dispatch 推 metadata | 源 rank 的 dispatch warp | 远端 `src_token_topk_idx`、`expert_recv_count(_sum)` | NVLink barrier |
+| dispatch pull | 目标 rank 的 dispatch warp | `l1_token_buffer` / `l1_sf_buffer` / `l1_topk_weights_buffer`，外加 `token_src_metadata` | `l1_full_count` |
+| L1 GEMM + epilogue | MMA warp + epilogue warpgroup | `l2_token_buffer` / `l2_sf_buffer` | `l2_full_count` 前进、`l1_empty_count` 回收 |
+| L2 GEMM + epilogue | MMA warp + epilogue warpgroup | 源 rank 的 `combine_token_buffer[topk_slot][token]` | NVLink barrier、`l2_empty_count` 回收 |
+| combine reduce | epilogue warp | `y[token, hidden]` | —— |
 
-**  → L2 GEMM**
+三个容易看漏的点：
 
-**  → L2 epilogue: BF16 → 按 token_src_metadata 推回**源 rank**的 combine_token_buffer[topk_slot][token]**
-
-**  → NVLink barrier (kBeforeCombineReduceBarrierTag)**
-
-**  → 源 rank 本地 reduce: 遍历 topk_slot 求和(FP32 累加)**
-
-**  → BF16 cast → TMA store → y[token, hidden]**
+- **route weight 在第 6 步就乘掉了**，不在 combine 阶段。所以 `combine_token_buffer` 里存的已经是加权后的 partial，最后的 reduce 退化成纯求和。
+- **combine 是「推」不是「拉」**：L2 epilogue 直接写远端地址，返程地址来自第 3 步顺手记下的 `token_src_metadata{rank_idx, token_idx, topk_idx}`。
+- **L1 / L2 都是 ring buffer**，不是全量池；槽位靠 empty 计数器循环回收，所以 full 计数器的目标值会跨 generation 累积，而不是每轮清零。

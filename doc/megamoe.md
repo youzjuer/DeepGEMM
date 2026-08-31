@@ -39,7 +39,7 @@ src_token_topk_idx，对应三维数组 `[local_ep][src_rank][slot]`，也就是
 
 **本 rank 的第 `local_ep` 个 expert，将从源 rank `j` 收到多少 token** 。
 
-## 1.3 实例
+## 1.3 实例1
 
 用一个小到能手算的配置： **2 rank、4 expert（每 rank 2 个）、topk=2、每 rank 4 token、BLOCK_M=2、每 rank 2 个 SM** 。
 
@@ -155,3 +155,87 @@ idx:   0      1      2      3
 ```
 
 于是：M 算不出来（需要 popcount 归约）；"第 n 个有效元素在哪"无法用除模表达（需要前缀和 + 二分）；GEMM tile 里混着无效行，MMA 空转。**这三件事正是 slot 这层抽象一次性解决的。**
+
+## 1.4 实例2
+
+追踪 **rank0 的 t0** 这一个 token 走完全程。它的路由是 `[E0, E2]` —— 两个副本去两块**不同的** GPU，最后两个结果又要汇合回 rank0，正好把余数的作用暴露出来。
+
+### 起点：rank0 上 t0 的两行元数据
+
+```text
+rank0.topk_idx[t0]     = [ E0 ,  E2 ]      展平下标 =  0 ,  1
+rank0.topk_weights[t0] = [0.7 , 0.3 ]
+```
+
+### 阶段 1：dispatch —— 两份记录分道扬镳
+
+```text
+token_topk_idx = 0  ─→ expert E0 ─→ dst_rank = 0/2 = 0 ─→ 写 rank0 的 src_token_topk_idx[ep0][rank0][slot=2] = 0
+token_topk_idx = 1  ─→ expert E2 ─→ dst_rank = 2/2 = 1 ─→ 写 rank1 的 src_token_topk_idx[ep0][rank0][slot=0] = 1
+                                                  ↑ 跨 NVLink
+```
+
+两块 GPU 各拿到一个 uint32：rank0 拿到 `0`，rank1 拿到 `1`。
+
+### 阶段 2：pull —— 商相同，余数不同
+
+|              | rank0 处理 E0                       | rank1 处理 E2                       |
+| ------------ | ----------------------------------- | ----------------------------------- |
+| 读到的值     | `0`                               | `1`                               |
+| 商 =`/2`   | **0**                         | **0** ← 相同                 |
+| 余数 =`%2` | **0**                         | **1** ← 不同                 |
+| 拉的 hidden  | rank0 的 `x[t0]`（本地）          | rank0 的 `x[t0]`（跨 NVLink）     |
+| 取的权重     | `topk_weights[0]` = **0.7** | `topk_weights[1]` = **0.3** |
+
+**两边拉的是同一份 hidden 向量** —— 因为商一样。整个 pull 过程里，余数唯一的作用就是让权重取对了那一列。
+
+### 阶段 3：存 metadata —— 只有一个字段不同
+
+```cpp
+// rank0 上
+token_src_metadata[pool行 a] = { rank_idx: 0, token_idx: 0, topk_idx: 0 }
+// rank1 上
+token_src_metadata[pool行 b] = { rank_idx: 0, token_idx: 0, topk_idx: 1 }
+                               └────── 完全相同 ──────┘   └── 唯一区别 ──┘
+```
+
+### 阶段 4：combine —— 余数选定写回的那一维
+
+两个 GPU 各自算完自己的 GEMM，互不知晓、时间上完全不协调：
+
+```text
+rank0 (E0 的输出)                          rank1 (E2 的输出)
+      │                                          │
+      │ get_rank_buffer(topk_idx=0)              │ get_rank_buffer(topk_idx=1)
+      │ get_data_buffer(token_idx=0)             │ get_data_buffer(token_idx=0)
+      │                                          │ 跨 NVLink
+      ▼                                          ▼
+┌──────────────── rank0 的 combine_token_buffer ────────────────┐
+│                     t0      t1     t2     t3                  │
+│  topk_slot 0    [ E0输出 ][    ][    ][    ]  ← rank0 本地写   │
+│  topk_slot 1    [ E2输出 ][    ][    ][    ]  ← rank1 远程写   │
+└───────────────────────────────────────────────────────────────┘
+              ↑ 两个地址不同 → 无冲突、无 barrier
+```
+
+下游按权重求和：
+
+y[t0]=0.7×buf[0][t0]+0.3×buf[1][t0]
+
+### 如果去掉余数，只存 token index
+
+两条 metadata 变成 `{rank:0, token:0}` 和 `{rank:0, token:0}` ——  **一模一样** 。回写地址都是 `buf[?][0]`：
+
+```text
+rank0 写 buf[0][t0] = E0输出
+rank1 写 buf[0][t0] = E2输出      ← 覆盖！
+                ↑ 同一个地址
+```
+
+后果有三层：
+
+1. **结果丢失** ：t0 只剩一个 expert 的贡献，另一个被覆盖，输出错误。
+2. **非确定性** ：哪个 GPU 先写不确定，同样的输入每次跑出不同结果 —— 这类 bug 最难查。
+3. **无法用同步救** ：写入是 `float4` 的 bf16 向量，没有对应的原子加指令；改成跨卡加锁的话，每个输出行都要一次远程 CAS，性能直接崩掉。
+
+而且即便侥幸不覆盖，**权重也会配错** —— `topk_weights[t0][0] = 0.7` 是给 E0 的，若 E2 的结果落在 slot 0，下游就会用 0.7 去乘 E2 的输出。

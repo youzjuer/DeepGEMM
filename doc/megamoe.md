@@ -167,6 +167,8 @@ rank0.topk_idx[t0]     = [ E0 ,  E2 ]      展平下标 =  0 ,  1
 rank0.topk_weights[t0] = [0.7 , 0.3 ]
 ```
 
+需要注意topk_weights和weights是两码事
+
 ### 阶段 1：dispatch —— 两份记录分道扬镳
 
 ```text

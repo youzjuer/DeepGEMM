@@ -289,17 +289,47 @@ get_num_experts_per_wave_for_mega_moe会计算出一个wave是多少个expert，
 
 分段对照：
 
-| 阶段 | 谁在做 | 产物落在哪 | 与下一段的衔接 |
-| --- | --- | --- | --- |
-| pre_dispatch | 独立 kernel（在 MegaMoE 之外） | 本 rank `input_token_buffer` | —— |
-| dispatch 推 metadata | 源 rank 的 dispatch warp | 远端 `src_token_topk_idx`、`expert_recv_count(_sum)` | NVLink barrier |
-| dispatch pull | 目标 rank 的 dispatch warp | `l1_token_buffer` / `l1_sf_buffer` / `l1_topk_weights_buffer`，外加 `token_src_metadata` | `l1_full_count` |
-| L1 GEMM + epilogue | MMA warp + epilogue warpgroup | `l2_token_buffer` / `l2_sf_buffer` | `l2_full_count` 前进、`l1_empty_count` 回收 |
-| L2 GEMM + epilogue | MMA warp + epilogue warpgroup | 源 rank 的 `combine_token_buffer[topk_slot][token]` | NVLink barrier、`l2_empty_count` 回收 |
-| combine reduce | epilogue warp | `y[token, hidden]` | —— |
+| 阶段                 | 谁在做                         | 产物落在哪                                                                                       | 与下一段的衔接                                  |
+| -------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------ | ----------------------------------------------- |
+| pre_dispatch         | 独立 kernel（在 MegaMoE 之外） | 本 rank `input_token_buffer`                                                                   | ——                                            |
+| dispatch 推 metadata | 源 rank 的 dispatch warp       | 远端 `src_token_topk_idx`、`expert_recv_count(_sum)`                                         | NVLink barrier                                  |
+| dispatch pull        | 目标 rank 的 dispatch warp     | `l1_token_buffer` / `l1_sf_buffer` / `l1_topk_weights_buffer`，外加 `token_src_metadata` | `l1_full_count`                               |
+| L1 GEMM + epilogue   | MMA warp + epilogue warpgroup  | `l2_token_buffer` / `l2_sf_buffer`                                                           | `l2_full_count` 前进、`l1_empty_count` 回收 |
+| L2 GEMM + epilogue   | MMA warp + epilogue warpgroup  | 源 rank 的 `combine_token_buffer[topk_slot][token]`                                            | NVLink barrier、`l2_empty_count` 回收         |
+| combine reduce       | epilogue warp                  | `y[token, hidden]`                                                                             | ——                                            |
 
 三个容易看漏的点：
 
 - **route weight 在第 6 步就乘掉了**，不在 combine 阶段。所以 `combine_token_buffer` 里存的已经是加权后的 partial，最后的 reduce 退化成纯求和。
 - **combine 是「推」不是「拉」**：L2 epilogue 直接写远端地址，返程地址来自第 3 步顺手记下的 `token_src_metadata{rank_idx, token_idx, topk_idx}`。
 - **L1 / L2 都是 ring buffer**，不是全量池；槽位靠 empty 计数器循环回收，所以 full 计数器的目标值会跨 generation 累积，而不是每轮清零。
+
+## 2.2 数据流转
+
+
+kernel 启动前，每个 rank 会分配一块同样大小、同样布局的通信 buffer。`symm_mem.rendezvous` 交换各 rank 的 buffer 基地址之后，kernel 里可以通过：
+
+```text
+sym_buffer.map(local_ptr, dst_rank_idx)
+```
+
+把“当前 rank 某个字段的本地地址”映射成“目标 rank 同 offset 字段的地址”。这就是整个 kernel 能在不退出 CUDA kernel 的情况下做跨 rank 读写的基础。
+
+dispatch 阶段没有直接把 token 推到目标 rank，而是分成两步：
+
+1. 源 rank 写远端 metadata，告诉目标 rank：“某个 local expert 的某条输入来自哪个** **`(src_rank, src_token_idx, src_topk_idx)`”。
+2. 目标 rank 等所有 metadata 可见后，主动从源 rank pull token、SF 和 top-k weight，按 local expert 的顺序填入本地共享 token pool。
+3. **GEMM 不在乎 M 方向的行序** 。tile 只要求"这 `BLOCK_M` 行同属一个 expert"，行与行之间独立，换个顺序结果一样。
+
+这种 “metadata push + payload pull” 的设计让目标 rank 能控制本地 expert pool 的布局。每个 local expert 在 pool 里占一段连续空间，段内按** **`BLOCK_M` 对齐；后面的 GEMM scheduler 只需要知道每个 expert 收到了多少 token，就能把 pool 切成一串 GEMM tile。
+
+1. 同一 expert 的 token 在 M 方向**连续**
+2. expert 的**边界落在 `BLOCK_M` 的整数倍上**
+
+combine 阶段方向相反。L2 epilogue 已经在 expert 所在 rank 上算出了结果，因此它直接把 BF16 partial result 远端写回原始 token 所在 rank 的：
+
+```text
+combine_token_buffer[topk_slot, token_idx, hidden]
+```
+
+所有 rank 写完以后，原始 token 所在 rank 再本地把有效 top-k 槽位累加，得到最终** **`y`。所以 dispatch 是“先告诉目标 rank 去哪里拉”，combine 是“算完后直接推回原始 token 的槽位”。
